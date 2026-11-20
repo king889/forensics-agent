@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# 一个会话做一题或一小批题。题目要先用 fcase import 导过。
+#
+#   solve                 # 下一题
+#   solve Q07             # 指定一题
+#   solve Q07 Q08 Q09     # 一题一批（同检材、题号连续最省）
+#   solve --batch 5       # 自动取下一批 5 题
+#   solve --batch 5 --group 冯子超手机
+#   solve --resume        # 带上本 case 最近 40 条命令，接着上次的思路
+#   solve --dry-run       # 只打印将加载什么，不启动
+#
+# 与 ask 的区别：ask 把全部技能+整卷题目塞进去；solve 只给这几道题、一个技能、一份简报，
+# 并用 .pi/extensions/guard.ts 接管 bash（截断/超时/拒绝安装/自动记账）。
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+export FORENSICS_ROOT="$ROOT"
+# 精简工具集优先：只有做题真用得上的十几个，避免 agent 去 ls 139 个目录
+[ -d "$ROOT/tools/bin-lite" ] && export PATH="$ROOT/tools/bin-lite:$PATH"
+export PATH="$ROOT/bin:$PATH"
+
+resume=0; dry=0; batch=1; group=""; extra=(); qids=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --resume) resume=1; shift ;;
+        --dry-run) dry=1; shift ;;
+        --batch) batch="$2"; shift 2 ;;
+        --group) group="$2"; shift 2 ;;
+        -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # 带值的 flag 必须整体吃掉，否则它的值会被当成题号
+        # （踩过：--model glm-5.3 → glm-5.3 被当成题号）
+        --model|--provider|--thinking|--session-dir|--name|-n|--theme|--use-theme|--tui-mode|--api-key)
+            extra+=("$1" "$2"); shift 2 ;;
+        -*) extra+=("$1"); shift ;;
+        *) qids+=("$(echo "$1" | tr '[:lower:]' '[:upper:]')"); shift ;;
+    esac
+done
+
+case_dir="$(pwd)"
+if [ ! -d "$case_dir/meta" ]; then
+    echo "solve: 当前目录不是 case（缺 meta/）" >&2
+    exit 2
+fi
+cd "$case_dir"
+
+if [ ${#qids[@]} -eq 0 ]; then
+    mapfile -t qids < <(fcase next --batch "$batch" ${group:+--group "$group"}) \
+        || { echo "solve: 没有待做的题了" >&2; exit 1; }
+fi
+[ ${#qids[@]} -gt 0 ] || { echo "solve: 没有待做的题了" >&2; exit 1; }
+
+first="${qids[0]}"; last="${qids[-1]}"
+if [ ${#qids[@]} -eq 1 ]; then
+    brief="$case_dir/meta/briefs/$first.md"
+else
+    brief="$case_dir/meta/briefs/batch-$first-$last.md"
+fi
+
+# 技能 / 检材：都按第一题取（批量只取同检材的题）
+meta_one() {
+    python3 - "$case_dir/meta/questions.json" "$first" "$1" <<'PY' 2>/dev/null || true
+import json,sys
+try: d=json.load(open(sys.argv[1],encoding="utf-8"))
+except Exception: sys.exit(0)
+for q in d.get("questions",[]):
+    if q["id"]==sys.argv[2]:
+        v=q.get(sys.argv[3]) or ""
+        print(",".join(v) if isinstance(v,list) else v)
+        break
+PY
+}
+skills="$(meta_one skills)"; artifact="$(meta_one artifact)"
+
+# 注意：`fcase mark doing` 必须放到 --dry-run 检查之后，
+# 否则 dry-run 会偷偷改状态，把题顶到队列前面（踩过：Q86 被 dry-run 标 doing 后插队）。
+fcase brief "${qids[@]}" >/dev/null
+
+# 子 agent：项目级 agents 目录 + guard 软链（子会话 cwd 是本 case，靠这两条才能找到）
+mkdir -p "$case_dir/.pi/extensions" "$case_dir/meta/sub"
+# 并发做题时多个 solve 同时跑这段，ln -sfn 会报 "Already exists" 并因 set -e 整个退出。
+# 所以先判后建，已存在就跳过（链接目标固定，不需要重建）。
+[ -L "$case_dir/.pi/agents" ] || [ -e "$case_dir/.pi/agents" ] \
+    || ln -sfn "$ROOT/.pi/agents" "$case_dir/.pi/agents"
+[ -L "$case_dir/.pi/extensions/guard.ts" ] || [ -e "$case_dir/.pi/extensions/guard.ts" ] \
+    || ln -sfn "$ROOT/.pi/extensions/guard.ts" "$case_dir/.pi/extensions/guard.ts"
+export FORENSICS_ROOT="$ROOT"
+
+[ -f "$brief" ] || { echo "solve: 简报没生成: $brief" >&2; exit 1; }
+
+skill_args=(-ns --skill "$ROOT/skills/forensics-workflow/SKILL.md")
+IFS=',' read -r -a sk <<< "$skills"
+for s in "${sk[@]}"; do
+    [ -n "$s" ] && [ -f "$ROOT/skills/$s/SKILL.md" ] && skill_args+=(--skill "$ROOT/skills/$s/SKILL.md")
+done
+
+resume_note=""
+if [ "$resume" = 1 ] && [ -f meta/cmdlog.jsonl ]; then
+    resume_note="$(tail -40 meta/cmdlog.jsonl | python3 -c '
+import sys,json
+for l in sys.stdin:
+    try: e=json.loads(l)
+    except Exception: continue
+    print(f"- {e.get(\"cmd\",\"\")[:120]}   → exit={e.get(\"exit\")} {e.get(\"saved\") or \"\"}")
+' 2>/dev/null || true)"
+fi
+
+prompt="$(cat "$brief")"
+if [ -n "$resume_note" ]; then
+    prompt="$prompt
+
+## 上一次这个 case 的命令（接着往下做，别重跑）
+$resume_note"
+fi
+
+if [ "$dry" = 1 ]; then
+    echo "题号     ${qids[*]}"
+    echo "技能     ${skills:-（未指定，只带 workflow）}"
+    echo "检材     ${artifact:-（未绑定）}"
+    echo "简报     $brief ($(wc -c < "$brief") 字节)"
+    echo "扩展     guard.ts + subagent"
+    echo "命令     pi -e guard.ts ${skill_args[*]} --append-system-prompt prompts/question.md <brief>"
+    exit 0
+fi
+
+mode=()
+[ -t 1 ] || mode=(-p)
+
+for q in "${qids[@]}"; do fcase mark "$q" doing >/dev/null 2>&1 || true; done
+
+echo "── ${qids[*]} ──────────────────────────────────"
+echo "检材 ${artifact:-（未绑定）}   技能 ${skills:-workflow}"
+echo "每道都要: fcase answer ... --q <题号>"
+echo "──────────────────────────────────────────────────"
+
+set +e
+pi "${mode[@]}" \
+    -e "$ROOT/.pi/extensions/guard.ts" \
+    -e "$ROOT/.pi/extensions/subagent" \
+    "${skill_args[@]}" \
+    --append-system-prompt "$ROOT/prompts/question.md" \
+    "${extra[@]}" \
+    "$prompt"
+rc=$?
+set -e
+
+# 校验：这批题里有几道真的交了答案
+answered=0; missing=()
+for q in "${qids[@]}"; do
+    if python3 - "$case_dir/meta/evidence.db" "$q" <<'PY'
+import sqlite3,sys
+db=sqlite3.connect(sys.argv[1])
+sys.exit(0 if db.execute("SELECT 1 FROM answers WHERE qid=? LIMIT 1",(sys.argv[2],)).fetchone() else 1)
+PY
+    then
+        answered=$((answered + 1))
+    else
+        missing+=("$q")
+        fcase mark "$q" doing >/dev/null 2>&1 || true
+    fi
+done
+
+echo
+if [ ${#missing[@]} -eq 0 ]; then
+    echo "✓ 全部 ${#qids[@]} 题都记录了答案"
+else
+    echo "✓ ${answered}/${#qids[@]} 题有答案；缺：${missing[*]}"
+    echo "  续跑: solve ${missing[*]} --resume"
+fi
+fcase render >/dev/null 2>&1 || true
+[ ${#missing[@]} -eq 0 ] || rc=1
+exit $rc

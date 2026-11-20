@@ -1,0 +1,350 @@
+#!/usr/bin/env python3
+"""bin/eval —— 三个已知答案的小 case，用来自证「改了之后是变快还是变慢」。
+
+为什么需要它：98 题那场跑了 68 分钟、0 个答案，事后只能靠读 3MB 的会话日志才搞清
+发生了什么。没有回归基线，每次改提示词/工具都只能靠感觉。
+
+三个 case 都是自己造的，答案写在 meta/expected.json 里：
+
+  case-pcap    318B 级 pcap：3 个 DNS 查询 + 1 个 HTTP 请求（含 token）
+  case-mobile  iOS 提取目录 zip：Info.plist + 5 条短信 + 1 个已保存 WiFi
+  case-disk    4MB 裸镜像：MBR + 一个 0x0C 分区
+
+用法：
+
+    bin/eval build                 # 生成 eval/case-*（可重复跑，会重建）
+    bin/eval check                 # 不花 token：import/index 是否正常、题绑对没、索引里有没有答案
+    bin/eval run                   # 每题起一个 solve 会话，跑完自动打分
+    bin/eval run --only mobile     # 只跑一个 case
+    bin/eval score                 # 只对已有答案打分
+
+打分规则：答案归一化（小写、去空白、去末尾标点）后互相包含即算对。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import plistlib
+import re
+import shutil
+import sqlite3
+import struct
+import subprocess
+import sys
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+EVAL_DIR = ROOT / "eval"
+FCASE = ROOT / "bin" / "fcase"
+SOLVE = ROOT / "bin" / "solve"
+SCAPY_PY = ROOT / "tools" / "venv" / "bin" / "python"
+
+CASES = {
+    "pcap": {
+        "group": "评测-网络",
+        "expected": {
+            "Q01": "3",
+            "Q02": "files.example.com",
+            "Q03": "flag_7f3a",
+        },
+        "questions": [
+            "pcap 里出现了几个不同的 DNS 查询域名？（阿拉伯数字）",
+            "HTTP 请求的 Host 是什么？",
+            "HTTP 请求路径里出现的 token 是什么？（形如 flag_xxxx）",
+        ],
+    },
+    "mobile": {
+        "group": "评测-手机",
+        "expected": {
+            "Q01": "17.2.1",
+            "Q02": "5",
+            "Q03": "EvalNet",
+        },
+        "questions": [
+            "这个手机是什么操作系统版本？（只要版本号）",
+            "短信数据库里 message 表有多少条记录？（阿拉伯数字）",
+            "手机保存过的 WiFi 的 SSID 是什么？",
+        ],
+    },
+    "disk": {
+        "group": "评测-磁盘",
+        "expected": {
+            "Q01": "1",
+            "Q02": "2048",
+            "Q03": "0x0c",
+        },
+        "questions": [
+            "镜像里有几个分区？（阿拉伯数字）",
+            "第一个分区的起始扇区是多少？（阿拉伯数字）",
+            "第一个分区的类型是什么？（十六进制，形如 0x83）",
+        ],
+    },
+}
+
+
+# ── 造检材 ───────────────────────────────────────────────────────────────────
+def build_pcap(evi: Path) -> None:
+    script = """
+import sys
+from scapy.all import IP, UDP, TCP, DNS, DNSQR, wrpcap
+pkts = []
+for i, name in enumerate(("a.example.com", "b.example.com", "c.example.com")):
+    pkts.append(IP(dst="10.0.0.1") / UDP(sport=40000 + i, dport=53) / DNS(rd=1, qd=DNSQR(qname=name)))
+pkts.append(
+    IP(dst="10.0.0.9") / TCP(sport=40010, dport=80, flags="PA")
+    / b"GET /flag_7f3a.txt HTTP/1.1\\r\\nHost: files.example.com\\r\\nUser-Agent: eval\\r\\n\\r\\n"
+)
+wrpcap(sys.argv[1], pkts)
+"""
+    tmp = evi.parent / "_build_pcap.py"
+    tmp.write_text(script, encoding="utf-8")
+    if not SCAPY_PY.exists():
+        raise SystemExit(f"缺 scapy：{SCAPY_PY}（tools/install.sh net）")
+    r = subprocess.run([str(SCAPY_PY), str(tmp), str(evi / "chat.pcap")], capture_output=True, text=True)
+    tmp.unlink(missing_ok=True)
+    if r.returncode != 0:
+        raise SystemExit("生成 pcap 失败：\n" + (r.stderr or r.stdout))
+
+
+def build_mobile(evi: Path) -> None:
+    zpath = evi / "EVAL_mobile.zip"
+    db = evi.parent / "_sms.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE message (ROWID INTEGER PRIMARY KEY, text TEXT, handle TEXT, date INTEGER)")
+    rows = [
+        (1, "今晚八点见", "+85290000001", 700000001),
+        (2, "钱收到了吗", "+85290000002", 700000002),
+        (3, "flag is eval_only", "+85290000003", 700000003),
+        (4, "删掉这条", "+85290000002", 700000004),
+        (5, "OK", "+85290000001", 700000005),
+    ]
+    con.executemany("INSERT INTO message VALUES (?,?,?,?)", rows)
+    con.commit()
+    con.close()
+
+    info = {
+        "Product Version": "17.2.1",
+        "Build Version": "21C62",
+        "Device Name": "EvalPhone",
+        "Product Type": "iPhone12,1",
+        "Serial Number": "EVAL00000001",
+        "IMEI": "350000000000001",
+        "MEID": "35000000000000",
+        "ICCID": "89860000000000000001",
+        "Unique Identifier": "00008101-000000000000000E",
+        "Applications": {"com.apple.mobilesms": {}, "net.whatsapp.WhatsApp": {}, "com.tencent.xin": {}},
+    }
+    wifi = {
+        "wifi.network.ssid.EvalNet": {
+            "SSID": b"EvalNet",
+            "Hidden": False,
+            "SupportedSecurityTypes": "WPA2 Personal",
+        },
+        "wifi.network.ssid.OtherNet": {"SSID": b"OtherNet", "Hidden": False},
+    }
+    idev = (
+        "ProductVersion: 17.2.1\nBuildVersion: 21C62\nProductType: iPhone12,1\n"
+        "SerialNumber: EVAL00000001\nBluetoothAddress: aa:bb:cc:dd:ee:ff\n"
+        "EthernetAddress: aa:bb:cc:dd:ee:01\nWiFiAddress: aa:bb:cc:dd:ee:02\n"
+        "InternationalMobileEquipmentIdentity: 350000000000001\n"
+        "IntegratedCircuitCardIdentity: 89860000000000000001\n"
+        "TimeZone: Asia/Hong_Kong\n"
+    )
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("iDevice_info.txt", idev)
+        z.writestr("var/Info.plist", plistlib.dumps(info, fmt=plistlib.FMT_BINARY))
+        z.writestr(
+            "var/preferences/com.apple.wifi.known-networks.plist",
+            plistlib.dumps(wifi, fmt=plistlib.FMT_BINARY),
+        )
+        z.write(db, "var/mobile/Library/SMS/sms.db")
+    db.unlink(missing_ok=True)
+
+
+def build_disk(evi: Path) -> None:
+    img = evi / "disk.raw"
+    size = 4 * 1024 * 1024
+    with open(img, "wb") as f:
+        mbr = bytearray(512)
+        ent = bytearray(16)
+        ent[0] = 0x80          # bootable
+        ent[4] = 0x0C          # FAT32 LBA
+        struct.pack_into("<I", ent, 8, 2048)    # start LBA
+        struct.pack_into("<I", ent, 12, 4096)   # sectors
+        mbr[446:462] = ent
+        mbr[510:512] = b"\x55\xaa"
+        f.write(mbr)
+        f.truncate(size)
+
+
+BUILDERS = {"pcap": build_pcap, "mobile": build_mobile, "disk": build_disk}
+ARTIFACT_HINT = {"pcap": "chat.pcap", "mobile": "EVAL_mobile.zip", "disk": "disk.raw"}
+
+
+def question_md(name: str) -> str:
+    spec = CASES[name]
+    lines = [f"## {spec['group']}", ""]
+    for n, stem in enumerate(spec["questions"], 1):
+        lines += [f"### {n}. 填空题（必答，0 / 1 分，未作答）", f"请你使用 `{ARTIFACT_HINT[name]}` 检材回答以下问题", stem, ""]
+    return "\n".join(lines)
+
+
+def cmd_build(a: argparse.Namespace) -> None:
+    for name in CASES:
+        if a.only and name != a.only:
+            continue
+        root = EVAL_DIR / f"case-{name}"
+        if root.exists():
+            subprocess.run(["chmod", "-R", "u+w", str(root)], check=False)
+            shutil.rmtree(root)
+        for d in ("evi", "work", "meta"):
+            (root / d).mkdir(parents=True)
+        BUILDERS[name](root / "evi")
+        (root / "meta" / "question.md").write_text(question_md(name), encoding="utf-8")
+        (root / "meta" / "expected.json").write_text(
+            json.dumps(CASES[name]["expected"], ensure_ascii=False, indent=1), encoding="utf-8"
+        )
+        (root / "evi").chmod(0o555)
+        size = sum(p.stat().st_size for p in (root / "evi").iterdir() if p.is_file())
+        print(f"  case-{name:7s} evi {size / 1024:8.1f}KB  {len(CASES[name]['questions'])} 题")
+    print(f"\n生成在 {EVAL_DIR}")
+
+
+# ── 检查（不花 token）─────────────────────────────────────────────────────────
+def run_fcase(case: Path, *args: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    env = dict(os.environ, PATH=f"{ROOT / 'bin'}:{os.environ.get('PATH', '')}")
+    return subprocess.run([str(FCASE), *args], cwd=case, capture_output=True, text=True, timeout=timeout, env=env)
+
+
+def norm(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = re.sub(r"\s+", "", s)
+    return s.rstrip("。.,，；;、")
+
+
+def matches(expected: str, answer: str) -> bool:
+    e, a = norm(expected), norm(answer)
+    if not a:
+        return False
+    if e.isdigit() and a.isdigit():
+        return int(e) == int(a)
+    return e in a or a in e
+
+
+def cmd_check(a: argparse.Namespace) -> None:
+    ok_all = True
+    for name, spec in CASES.items():
+        if a.only and name != a.only:
+            continue
+        case = EVAL_DIR / f"case-{name}"
+        if not case.exists():
+            print(f"  case-{name}: 不存在，先 bin/eval build")
+            ok_all = False
+            continue
+        r = run_fcase(case, "import")
+        if r.returncode != 0:
+            print(f"  case-{name}: import 失败\n{r.stdout}{r.stderr}")
+            ok_all = False
+            continue
+        run_fcase(case, "index")
+        db = case / "meta" / "evidence.db"
+        con = sqlite3.connect(db)
+        con.row_factory = sqlite3.Row
+        qs = con.execute("SELECT id, artifact, status FROM questions ORDER BY n").fetchall()
+        con.close()
+        idx = list((case / "meta" / "index").glob("*.json"))
+        problems = []
+        if len(qs) != len(spec["questions"]):
+            problems.append(f"题数 {len(qs)}≠{len(spec['questions'])}")
+        unbound = [q["id"] for q in qs if not q["artifact"]]
+        if unbound:
+            problems.append(f"未绑检材 {unbound}")
+        if not idx:
+            problems.append("没有索引")
+        # 索引里是否已经含有答案（能提前答对说明索引够用）
+        blob = ""
+        for p in idx:
+            blob += p.read_text(encoding="utf-8", errors="replace")
+        hits = [qid for qid, exp in spec["expected"].items() if norm(exp) in norm(blob)]
+        status = "OK" if not problems else "FAIL " + "; ".join(problems)
+        print(f"  case-{name:7s} {len(qs)} 题 · 索引 {len(idx)} 个 · 索引内已有答案 {len(hits)}/{len(spec['expected'])}  {status}")
+        ok_all = ok_all and not problems
+    sys.exit(0 if ok_all else 1)
+
+
+# ── 打分 ─────────────────────────────────────────────────────────────────────
+def score_case(name: str) -> tuple[int, int]:
+    case = EVAL_DIR / f"case-{name}"
+    expected = json.loads((case / "meta" / "expected.json").read_text(encoding="utf-8"))
+    db = case / "meta" / "evidence.db"
+    if not db.exists():
+        print(f"  case-{name}: 没有 evidence.db（没 import 过）")
+        return 0, len(expected)
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    rows = {r["qid"]: r["answer"] for r in con.execute("SELECT qid, answer FROM answers WHERE qid IS NOT NULL")}
+    con.close()
+    good = 0
+    for qid, exp in expected.items():
+        got = rows.get(qid, "")
+        hit = matches(exp, got)
+        good += hit
+        mark = "✓" if hit else "✗"
+        print(f"  case-{name:7s} {qid} {mark} 期望 {exp!r:28s} 实得 {got[:50]!r}")
+    return good, len(expected)
+
+
+def cmd_score(a: argparse.Namespace) -> None:
+    total = 0
+    want = 0
+    for name, spec in CASES.items():
+        if a.only and name != a.only:
+            continue
+        g, n = score_case(name)
+        total += g
+        want += n
+    print(f"\n得分 {total}/{want}")
+    sys.exit(0 if total == want else 1)
+
+
+def cmd_run(a: argparse.Namespace) -> None:
+    env = dict(os.environ, PATH=f"{ROOT / 'bin'}:{os.environ.get('PATH', '')}")
+    timeout = int(os.environ.get("EVAL_SOLVE_TIMEOUT", "600"))
+    for name, spec in CASES.items():
+        if a.only and name != a.only:
+            continue
+        case = EVAL_DIR / f"case-{name}"
+        if not case.exists():
+            raise SystemExit(f"case-{name} 不存在，先 bin/eval build")
+        run_fcase(case, "import")
+        run_fcase(case, "index")
+        for qid in spec["expected"]:
+            print(f"\n── case-{name} {qid} ──")
+            try:
+                r = subprocess.run([str(SOLVE), qid], cwd=case, capture_output=True, text=True,
+                                   timeout=timeout, env=env)
+                tail = "\n".join((r.stdout or "").strip().splitlines()[-6:])
+                print(tail or "(无输出)")
+            except subprocess.TimeoutExpired:
+                print(f"  solve {qid} 超时 {timeout}s")
+    print()
+    cmd_score(a)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="三个已知答案的小 case：建、查、跑、打分")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name, fn in (("build", cmd_build), ("check", cmd_check), ("run", cmd_run), ("score", cmd_score)):
+        sp = sub.add_parser(name)
+        sp.add_argument("--only", choices=list(CASES), help="只处理一个 case")
+        sp.set_defaults(fn=fn)
+    a = p.parse_args()
+    EVAL_DIR.mkdir(exist_ok=True)
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

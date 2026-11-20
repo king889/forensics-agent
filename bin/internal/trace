@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""把 Pi 会话记录（jsonl）打印成可读的调查轨迹。
+
+Pi 把每次会话完整存在 ~/.pi/agent/sessions/<cwd 编码>/<时间戳>_<id>.jsonl，
+里面有：用户提示、模型的 thinking 块、工具调用、工具结果、最终回答。
+这个脚本把它压成人类能扫的格式 —— 主要用来回答“agent 当时在想什么、为什么走了这条路”。
+
+用法：
+    trace                    # 当前目录最近一次会话
+    trace --list             # 列出这个 case 的所有会话
+    trace -n 15              # 只看最后 15 步
+    trace --thinking-only    # 只看模型的思考
+    trace --tools-only       # 只看执行了什么命令
+    trace --full             # 不截断
+    trace <某个 .jsonl>       # 看指定会话
+    trace --other <目录>      # 看别的目录下的会话
+
+设计取舍：
+    默认截断工具结果（头 4 行 + 行数），因为一次 fls 输出几千行没有阅读价值；
+    要看全文加 --full，或者直接 read 落盘文件（guard 会给出路径）。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+SESSIONS = Path.home() / ".pi" / "agent" / "sessions"
+
+DIM = "\033[2m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+RESET = "\033[0m"
+
+
+def encode_cwd(cwd: str) -> str:
+    """Pi 的会话目录命名规则：把路径里的 / 换成 -，包在 -- 里。"""
+    return "--" + cwd.strip("/").replace("/", "-") + "--"
+
+
+def session_dir(cwd: str | None = None) -> Path:
+    return SESSIONS / encode_cwd(os.path.abspath(cwd or os.getcwd()))
+
+
+def list_sessions(d: Path) -> list[Path]:
+    if not d.is_dir():
+        return []
+    return sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def load(path: Path) -> list[dict]:
+    out = []
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def clip(text: str, limit: int) -> str:
+    text = text.rstrip()
+    lines = text.splitlines()
+    if len(lines) > limit:
+        return "\n".join(lines[:limit]) + f"\n{DIM}…（共 {len(lines)} 行，--full 看全部）{RESET}"
+    return text
+
+
+def steps_of(entries: list[dict], *, thinking: bool, tools: bool) -> list[tuple[str, object]]:
+    steps: list[tuple[str, object]] = []
+    for e in entries:
+        if e.get("type") != "message":
+            continue
+        m = e.get("message") or {}
+        role = m.get("role")
+        if role == "user":
+            blocks = [c for c in (m.get("content") or []) if c.get("type") == "text"]
+            text = "\n".join(c.get("text", "") for c in blocks).strip()
+            if text:
+                steps.append(("user", text))
+        elif role == "assistant":
+            for c in m.get("content") or []:
+                t = c.get("type")
+                if t == "thinking" and thinking:
+                    steps.append(("thinking", c.get("thinking") or c.get("text") or ""))
+                elif t == "text" and (c.get("text") or "").strip():
+                    steps.append(("answer", c.get("text", "")))
+                elif t == "toolCall" and tools:
+                    steps.append(("tool", c))
+        elif role == "toolResult" and tools:
+            steps.append(("result", m))
+
+    return steps
+
+
+def render_steps(steps: list[tuple[str, object]], *, full: bool) -> None:
+    for kind, payload in steps:
+        if kind == "user":
+            print(f"{CYAN}▶ 输入{RESET}")
+            print(clip(str(payload), 40 if full else 12))
+            print()
+        elif kind == "thinking":
+            print(f"{MAGENTA}◆ 思考{RESET}")
+            body = str(payload).strip()
+            print(f"{DIM}" + (body if full else clip(body, 12)) + f"{RESET}")
+            print()
+        elif kind == "tool":
+            name = payload.get("name")
+            args = payload.get("arguments") or {}
+            detail = args.get("command") or args.get("path") or json.dumps(args, ensure_ascii=False)
+            print(f"{YELLOW}$ {name}{RESET} {clip(str(detail), 6 if full else 3)}")
+        elif kind == "result":
+            content = payload.get("content") or []
+            text = "\n".join(c.get("text", "") for c in content if c.get("type") == "text")
+            ms = payload.get("durationMs")
+            flag = f" {DIM}({ms}ms){RESET}" if ms else ""
+            if payload.get("isError"):
+                flag += f" {DIM}[error]{RESET}"
+            body = clip(text, 40 if full else 4)
+            if body.strip():
+                print(f"{DIM}  {body}{RESET}")
+            print(flag)
+        elif kind == "answer":
+            print(f"{GREEN}✓ 输出{RESET}")
+            print(clip(str(payload), 60 if full else 20))
+            print()
+
+
+def render(entries, *, last, full, thinking, tools):
+    steps = steps_of(entries, thinking=thinking, tools=tools)
+    if last:
+        steps = steps[-last:]
+    n_thinking = sum(1 for k, _ in steps if k == "thinking")
+    n_tool = sum(1 for k, _ in steps if k == "tool")
+    print(f"{DIM}── {len(steps)} 步（思考 {n_thinking}，工具 {n_tool}）──{RESET}\n")
+    render_steps(steps, full=full)
+
+
+def follow(path: Path, *, full: bool, thinking: bool, tools: bool, last: int) -> None:
+    """持续跟进：只打印新增的步骤。"""
+    shown = 0
+    steps = steps_of(load(path), thinking=thinking, tools=tools)
+    if last:
+        steps = steps[-last:]
+        shown = len(steps)
+    print(f"{DIM}跟进 {path}（Ctrl+C 退出）{RESET}\n")
+    render_steps(steps, full=full)
+    while True:
+        time.sleep(1)
+        try:
+            steps = steps_of(load(path), thinking=thinking, tools=tools)
+        except OSError:
+            continue
+        if len(steps) > shown:
+            render_steps(steps[shown:], full=full)
+            shown = len(steps)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="查看 Pi 会话轨迹（含模型思考）")
+    ap.add_argument("session", nargs="?", help="会话 .jsonl 路径；默认取当前目录最近一次")
+    ap.add_argument("--list", action="store_true", help="列出该目录的会话")
+    ap.add_argument("--other", help="换一个目录（按它的 cwd 找会话）")
+    ap.add_argument("-n", "--last", type=int, default=0, help="只看最后 N 步")
+    ap.add_argument("--full", action="store_true", help="不截断")
+    ap.add_argument("--thinking-only", action="store_true", help="只看思考")
+    ap.add_argument("--tools-only", action="store_true", help="只看工具调用")
+    ap.add_argument("-f", "--follow", action="store_true", help="持续跟进新增步骤")
+    args = ap.parse_args()
+
+    if args.session:
+        path = Path(args.session)
+        if not path.is_file():
+            print(f"没有这个文件: {path}", file=sys.stderr)
+            return 2
+    else:
+        d = session_dir(args.other)
+        sessions = list_sessions(d)
+        if args.list:
+            if not sessions:
+                print(f"{d} 下没有会话", file=sys.stderr)
+                return 1
+            for p in sessions[:40]:
+                print(f"{p.stat().st_size:>9,}B  {p.name}")
+            return 0
+        if not sessions:
+            print(f"{d} 下没有会话。换目录用 --other，或直接给 .jsonl 路径。", file=sys.stderr)
+            return 1
+        path = sessions[0]
+
+    if args.follow:
+        try:
+            follow(path, full=args.full, thinking=not args.tools_only,
+                   tools=not args.thinking_only, last=args.last)
+        except KeyboardInterrupt:
+            print()
+        return 0
+
+    entries = load(path)
+    print(f"{DIM}{path}{RESET}\n")
+    render(
+        entries,
+        last=args.last,
+        full=args.full,
+        thinking=not args.tools_only,
+        tools=not args.thinking_only,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

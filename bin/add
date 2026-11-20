@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# evi/ 管理：软链检材进来（不复制），并给目录上写保护。
+#
+#   add <path...>            软链进 evi/（默认）
+#   add --copy <path...>     复制进来
+#   add --lock               锁 evi/（chmod 555，解包写不进去）
+#   add --unlock             解锁（chmod 755）
+#   add --list               看 evi/ 里有什么、指向哪
+#
+# 软链的好处：30GB 的镜像不用复制，也不占第二份空间。
+# 锁的是 evi/ 目录本身，所以不会改到软链指向的原件权限。
+set -euo pipefail
+
+die() { echo "add: $*" >&2; exit 2; }
+
+case_dir="$(pwd)"
+[ -d "$case_dir/meta" ] || die "当前目录不是 case（缺 meta/），先 cd 到 case 目录"
+EVI="$case_dir/evi"
+mkdir -p "$EVI"
+
+lock()   { chmod 555 "$EVI"; echo "已锁 evi/（555）—— 解包/新建会失败"; }
+unlock() { chmod 755 "$EVI"; }
+
+mode=link
+args=()
+for a in "$@"; do
+    case "$a" in
+        --copy)   mode=copy ;;
+        --link)   mode=link ;;
+        --lock)   lock; exit 0 ;;
+        --unlock) unlock; echo "已解锁 evi/（755）"; exit 0 ;;
+        --list)
+            find "$EVI" -mindepth 1 -maxdepth 2 -printf '%-40P -> %l\n' | sort
+            exit 0 ;;
+        -h|--help) sed -n '2,12p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -*) die "未知选项 $a" ;;
+        *)  args+=("$a") ;;
+    esac
+done
+
+[ ${#args[@]} -gt 0 ] || die "没给路径。用法: add <path...>"
+
+unlock
+added=0
+for src in "${args[@]}"; do
+    [ -e "$src" ] || die "不存在: $src"
+    src="$(realpath "$src")"
+
+    if [ -d "$src" ]; then
+        # 目录：在 evi/ 里建真实目录树，叶子做软链
+        base="$(basename "$src")"
+        [ -e "$EVI/$base" ] && die "已存在: evi/$base（先删掉或换名）"
+        mkdir -p "$EVI/$base"
+        while IFS= read -r -d '' f; do
+            rel="${f#"$src"/}"
+            mkdir -p "$EVI/$base/$(dirname "$rel")"
+            ln -s "$f" "$EVI/$base/$rel"
+            added=$((added + 1))
+        done < <(find "$src" -type f -print0)
+        echo "evi/$base/  <- $src（$added 个文件，软链）"
+    else
+        base="$(basename "$src")"
+        [ -e "$EVI/$base" ] && die "已存在: evi/$base（先删掉或换名）"
+        if [ "$mode" = copy ]; then
+            cp -p "$src" "$EVI/$base"
+            echo "evi/$base  <- $src（复制）"
+        else
+            ln -s "$src" "$EVI/$base"
+            echo "evi/$base  -> $src（软链）"
+        fi
+        added=$((added + 1))
+    fi
+done
+
+lock
+echo
+echo "登记清单: fcase ls"

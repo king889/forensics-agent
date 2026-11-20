@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# 在当前 case 目录里起 Pi，带上取证 skills 和行为规约。
+#
+#   cd $CASES_ROOT/test
+#   $ROOT/bin/ask            # 读 meta/question.md
+#   $ROOT/bin/ask "USB 里有什么"  # 直接问
+#
+# 额外的 pi 参数会透传：
+#   ask -c              # 继续上一次会话
+#   ask --model xxx
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+case_dir="$(pwd)"
+if [ ! -d "$case_dir/meta" ]; then
+    echo "ask: 当前目录不是 case（缺 meta/）" >&2
+    echo "     先 cd 到 case 目录，或用 $ROOT/bin/case <id> 新建" >&2
+    exit 2
+fi
+
+export FCASE_ROOT="$case_dir"
+# tools/bin 是第三方工具入口（jadx / rizin / androguard / aleapp ...）
+export PATH="$ROOT/tools/bin:$ROOT/bin:$PATH"
+mkdir -p "$case_dir/work"
+
+cd "$case_dir"
+
+if [ $# -eq 0 ]; then
+    if [ -f meta/question.md ]; then
+        prompt="$(cat meta/question.md)"
+    else
+        prompt="evi/ 里有哪些检材？先给我一份清单和分类。"
+    fi
+else
+    prompt="$*"
+fi
+
+# 非交互环境（管道/脚本）用 -p，否则 Pi 会等 TTY 而挂住
+mode=()
+[ -t 1 ] || mode=(-p)
+
+exec pi "${mode[@]}" \
+    --skill "$ROOT/skills" \
+    --append-system-prompt "$ROOT/prompts/agent.md" \
+    "$prompt"

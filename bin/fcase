@@ -1,0 +1,2880 @@
+#!/usr/bin/env python3
+"""fcase —— case 目录里记录检材、线索、答案的小工具。
+
+布局（一个 case 一个目录）::
+
+    <case>/evi    原始检材。只读约定：本工具永不写入。
+    <case>/work   中间产物：解包、导出、临时文件，随便写。
+    <case>/meta   question.md notes.md findings.md answers.md evidence.db
+
+设计原则：只做「记录」，不做「分析」。分析交给 tshark / sleuthkit / 7z / 模型。
+这样它只有 300 行，不会挡住你。
+
+用法::
+
+    fcase ls [--hash]                 列出 evi/，写 meta/inventory.md
+    fcase hash <path>                 算 sha256 并记入 evidence.db
+    fcase import <question.md>        解析题目 → questions 表 + meta/questions.json
+    fcase board                       98 题看板（按检材分组）
+    fcase next                        下一题（先易后难：检材小的先做）
+    fcase show <Q07>                  题干 + 选项 + 已有线索 + 死路
+    fcase brief <Q07>                 生成 meta/briefs/Q07.md（进上下文的作战简报）
+    fcase note <kind> <text> [--q Q07] [--locator L] [--src S]
+    fcase answer <问题> <答案> [--q Q07] [--evidence E] [--confidence C]
+    fcase status                      一句话概况
+    fcase render                      重新生成 meta/*.md
+    fcase where                       打印当前 case 根目录
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import hashlib
+import json
+import os
+import plistlib
+import re
+import sqlite3
+import subprocess
+import time
+import sys
+import zipfile
+from datetime import datetime, timezone
+from pathlib import Path
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS artifacts (
+    id         INTEGER PRIMARY KEY,
+    path       TEXT UNIQUE NOT NULL,   -- 相对 evi/ 的路径
+    size_bytes INTEGER NOT NULL,
+    sha256     TEXT,
+    mtime      TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS findings (
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    text       TEXT NOT NULL,
+    locator    TEXT,
+    src        TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS answers (
+    id         INTEGER PRIMARY KEY,
+    question   TEXT NOT NULL,
+    answer     TEXT NOT NULL,
+    evidence   TEXT,
+    confidence REAL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS questions (
+    id         TEXT PRIMARY KEY,      -- Q01
+    n          INTEGER NOT NULL,      -- 1
+    grp        TEXT,                  -- 组名：陈民浩手机
+    artifact   TEXT,                  -- evi/ 里的文件名
+    skills     TEXT,                  -- 逗号分隔：mobile
+    type       TEXT,                  -- single | multi | fill | judge
+    points     INTEGER NOT NULL DEFAULT 1,
+    stem       TEXT NOT NULL,
+    choices    TEXT,                  -- JSON: [{"k":"A","t":"..."}]
+    status     TEXT NOT NULL DEFAULT 'todo',   -- todo | doing | done | blocked
+    cost       INTEGER NOT NULL DEFAULT 0,     -- 排序用：检材字节数
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deadends (
+    id         INTEGER PRIMARY KEY,
+    qid        TEXT,
+    text       TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS groups (
+    id         TEXT PRIMARY KEY,      -- G1
+    name       TEXT,                  -- 人类可读：WhatsApp 账号与社群
+    artifact   TEXT,                  -- 绑定的检材
+    qids       TEXT,                  -- 逗号分隔
+    depends    TEXT,                  -- 依赖的组，逗号分隔
+    est_min    INTEGER DEFAULT 0,     -- 预估分钟
+    status     TEXT DEFAULT 'todo'    -- todo | doing | done
+);
+CREATE TABLE IF NOT EXISTS agents (
+    id         TEXT PRIMARY KEY,      -- A1
+    grp        TEXT,                  -- 负责的组
+    model      TEXT,
+    status     TEXT DEFAULT 'idle',   -- idle | running | stalled | done | dead
+    current_qid TEXT,
+    pid        INTEGER,
+    session    TEXT,
+    started    TEXT,
+    last_seen  TEXT,
+    note       TEXT
+);
+CREATE TABLE IF NOT EXISTS attempts (
+    id         INTEGER PRIMARY KEY,
+    qid        TEXT NOT NULL,
+    attempt    INTEGER NOT NULL,
+    model      TEXT,
+    started    TEXT,
+    ended      TEXT,
+    status     TEXT,                  -- solved | failed | timeout | abandoned
+    session    TEXT,
+    note       TEXT
+);
+"""
+
+# 旧库补列（v2 的 evidence.db 没有 qid）
+MIGRATIONS = [
+    ("findings", "qid", "TEXT"),
+    ("answers", "qid", "TEXT"),
+    ("agents", "q_started", "TEXT"),                # 当前这道题什么时候开始的
+    ("findings", "attempt", "INTEGER DEFAULT 0"),   # 属于第几次尝试
+    ("answers", "attempt", "INTEGER DEFAULT 0"),
+]
+
+
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
+
+
+def load_config() -> dict:
+    """项目级默认配置（模型、超时、预算）。读不到就用空字典。"""
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def cfg(key: str, default=None):
+    return load_config().get(key, default)
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def die(msg: str, code: int = 2) -> None:
+    print(f"fcase: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def find_root(start: str | None = None) -> Path | None:
+    """向上找含 meta/ 的目录。"""
+    p = Path(start or os.environ.get("FCASE_ROOT") or Path.cwd()).resolve()
+    for d in (p, *p.parents):
+        if (d / "meta").is_dir():
+            return d
+    return None
+
+
+class Case:
+    def __init__(self) -> None:
+        root = find_root()
+        if root is None:
+            die("找不到 case 目录（需要 <case>/meta/）。先 cd 到 case，或设 FCASE_ROOT")
+        self.root: Path = root
+        self.evi = root / "evi"
+        self.work = root / "work"
+        self.meta = root / "meta"
+        self.arts = root / "artifacts"
+        self.scratch = root / "scratch"
+        self.meta.mkdir(exist_ok=True)
+        self.work.mkdir(exist_ok=True)
+        self.arts.mkdir(exist_ok=True)
+        # timeout=30：并发做题时多个进程抢写，5 秒默认值容易直接报 database is locked
+        self.db = sqlite3.connect(self.meta / "evidence.db", timeout=30)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript(SCHEMA)
+        for table, col, typ in MIGRATIONS:
+            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if col not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+        self.db.commit()
+
+    def close(self) -> None:
+        self.db.commit()
+        self.db.close()
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(4 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def human(n: int) -> str:
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return str(n)
+
+
+# ---------------------------------------------------------------- 子命令
+
+
+def cmd_ls(c: Case, a: argparse.Namespace) -> None:
+    if not c.evi.is_dir():
+        die(f"{c.evi} 不存在")
+    rows = []
+    for p in sorted(c.evi.rglob("*")):
+        # is_file() 会跟随软链；断链返回 False，正好跳过
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(c.evi))
+        st = p.stat()
+        sha = sha256_of(p) if a.hash else None
+        c.db.execute(
+            """INSERT INTO artifacts(path,size_bytes,sha256,mtime,created_at)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(path) DO UPDATE SET
+                 size_bytes=excluded.size_bytes,
+                 sha256=COALESCE(excluded.sha256, artifacts.sha256),
+                 mtime=excluded.mtime""",
+            (rel, st.st_size, sha, datetime.fromtimestamp(st.st_mtime, timezone.utc).isoformat(), now()),
+        )
+        rows.append((rel, st.st_size, sha))
+    c.db.commit()
+
+    w = max((len(r[0]) for r in rows), default=4)
+    print(f"{'path'.ljust(w)}  {'size':>9}  sha256")
+    for rel, size, sha in rows:
+        print(f"{rel.ljust(w)}  {human(size):>9}  {(sha or '-')[:16]}")
+    print(f"\n{len(rows)} 个检材，合计 {human(sum(r[1] for r in rows))}")
+
+
+def cmd_hash(c: Case, a: argparse.Namespace) -> None:
+    p = Path(a.path)
+    if not p.is_absolute():
+        p = c.evi / a.path
+    p = p.resolve()
+    if not p.is_file():
+        die(f"不是文件: {p}")
+    sha = sha256_of(p)
+    rel = str(p.relative_to(c.evi)) if c.evi in p.parents else str(p)
+    c.db.execute(
+        """INSERT INTO artifacts(path,size_bytes,sha256,mtime,created_at)
+           VALUES(?,?,?,?,?)
+           ON CONFLICT(path) DO UPDATE SET sha256=excluded.sha256""",
+        (rel, p.stat().st_size, sha, datetime.fromtimestamp(p.stat().st_mtime, timezone.utc).isoformat(), now()),
+    )
+    c.db.commit()
+    print(f"{rel}  {p.stat().st_size}B  {sha}")
+
+
+def current_attempt(c: Case, qid: str | None) -> int:
+    """该题当前是第几次尝试（没有记录就是 0）。"""
+    if not qid:
+        return 0
+    r = c.db.execute("SELECT COALESCE(MAX(attempt),0) FROM attempts WHERE qid=?", (qid,)).fetchone()
+    return r[0] if r else 0
+
+
+def cmd_note(c: Case, a: argparse.Namespace) -> None:
+    qid = getattr(a, "q", None)
+    cur = c.db.execute(
+        "INSERT INTO findings(kind,text,locator,src,qid,attempt,created_at) VALUES(?,?,?,?,?,?,?)",
+        (a.kind, a.text, a.locator, a.src, qid, current_attempt(c, qid), now()),
+    )
+    c.db.commit()
+    print(f"finding #{cur.lastrowid} 记下了")
+
+
+def cmd_answer(c: Case, a: argparse.Namespace) -> None:
+    qid = getattr(a, "q", None)
+    cur = c.db.execute(
+        "INSERT INTO answers(question,answer,evidence,confidence,qid,attempt,created_at) VALUES(?,?,?,?,?,?,?)",
+        (a.question, a.answer, a.evidence, a.confidence, qid, current_attempt(c, qid), now()),
+    )
+    if qid:
+        c.db.execute("UPDATE questions SET status='done' WHERE id=?", (qid,))
+    c.db.commit()
+    print(f"answer #{cur.lastrowid} 记下了" + (f"（{qid} → done）" if qid else ""))
+
+
+def cmd_status(c: Case, a: argparse.Namespace) -> None:
+    """一屏遥测：进度 / 吞吐 / 浪费来源。"""
+    q = c.db.execute
+    tot = q("SELECT count(*) FROM questions").fetchone()[0]
+    ans = q("SELECT count(DISTINCT qid) FROM answers WHERE qid IS NOT NULL").fetchone()[0]
+    grp = dict(q("SELECT status,count(*) FROM groups GROUP BY status").fetchall())
+    qst = dict(q("SELECT status,count(*) FROM questions GROUP BY status").fetchall())
+    print(f"CASE {c.root.name}: {tot} 题 | 已答 {ans} | "
+          + " ".join(f"{k}={v}" for k, v in sorted(grp.items())))
+
+    # cmdlog 统计
+    log = c.meta / "cmdlog.jsonl"
+    rows = []
+    if log.is_file():
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                rows.append(json.loads(line))
+            except ValueError:
+                pass
+    if rows:
+        import statistics as _st
+        ms = [r.get("ms") or 0 for r in rows]
+        killed = [r for r in rows if str(r.get("exit")) in ("None", "124")
+                  or (r.get("ms") or 0) >= 179000 and (r.get("ms") or 0) <= 181000]
+        rej = [r for r in rows if r.get("rejected")]
+        print(f"TOOLS {len(rows)} 条 | 总 {(sum(ms)/3600000):.2f}h | 中位 {_st.median(ms)/1000:.2f}s | "
+              f">10s {sum(1 for x in ms if x > 10000)} 条 | 超时 {len(killed)} 条 | 拦截 {len(rej)} 条")
+        if killed:
+            print(f"      超时浪费 {(sum((r.get('ms') or 0) for r in killed)/60000):.0f} 分钟")
+        # 病态模式
+        import re as _re
+        pats = [("find /", r"find\s+/\s"), ("镜像上 grep", r"grep\b[^|]*-[a-zA-Z]*a[^|]*evi/"),
+                ("icat 循环", r"(for|while)[^|]*icat"), ("整镜像哈希", r"(sha1sum|md5sum|sha256sum)\s+evi/")]
+        for name, pat in pats:
+            n = sum(1 for r in rows if _re.search(pat, str(r.get("cmd", ""))))
+            if n:
+                print(f"      病态: {name} {n} 条")
+
+    # attempts
+    try:
+        at = q("SELECT status,count(*) FROM attempts GROUP BY status").fetchall()
+        if at:
+            print("ATTEMPTS " + " ".join(f"{k}={v}" for k, v in at))
+    except Exception:
+        pass
+
+    # 最慢的未完成组
+    try:
+        slow = q("""SELECT id, est_min FROM groups
+                    WHERE status!='done' ORDER BY est_min DESC LIMIT 3""").fetchall()
+        if slow:
+            print("SLOW   " + " | ".join(f"{r['id']}({r['est_min']}m)" for r in slow))
+    except Exception:
+        pass
+
+    blk = c.meta / "blocked.md"
+    if blk.is_file():
+        n = sum(1 for l in blk.read_text(encoding="utf-8").splitlines() if l.startswith("- [ ]"))
+        if n:
+            print(f"BLOCKED {n} 条 → meta/blocked.md")
+
+
+
+def cmd_where(c: Case, a: argparse.Namespace) -> None:
+    print(c.root)
+
+
+# ---------------------------------------------------------------- 题目
+
+Q_TYPES = {"单选题": "single", "多选题": "multi", "填空题": "fill", "判断题": "judge"}
+TYPE_CN = {"single": "单选", "multi": "多选", "fill": "填空", "judge": "判断"}
+STATUS_CN = {"todo": "·", "doing": "~", "done": "✓", "blocked": "!"}
+
+# 题目：`## 1. 填空题（必答，10分）` 或 `### 1. ...` 都认
+Q_RE = re.compile(r"^#{2,4}\s+(\d+)[.、]\s*(.+?)（([^）]*)）\s*$")
+# 分组：题目行之外的任意标题（# / ## / ###）
+GROUP_RE = re.compile(r"^#{1,4}\s+(?!\d+[.、])(.+?)\s*$")
+# 宽松格式：`1. 问题` 没有分值元信息，也允许
+Q_RE_LOOSE = re.compile(r"^(\d{1,3})[.、)]\s*(\S.*?)\s*$")
+OPT_RE = re.compile(r"^[-*]\s+([A-Z])[.、．)]\s+(.*)$")
+FILE_RE = re.compile(r"`([^`]+\.(?:zip|e01|E01|bin|pcap|pcapng|7z|rar|dd|raw|img))`")
+
+
+def norm_name(s: str) -> str:
+    """归一化用于比对的名字。**必须保留中日韩字符** ——
+    只用 [^a-z0-9] 会把「黄志远」删成空，导致
+    黄志远/phone.E01 和 方俊郎/phone.E01 归一化后完全相同，人名校验失效。"""
+    return re.sub(r"[^a-z0-9\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff]", "", str(s).lower())
+
+
+def parse_question_md(text: str) -> tuple[list[str], list[dict]]:
+    """把 question.md 拆成 (分组名列表, 题目列表)。只认 ## 分组 + ### N. 题型（元信息）。"""
+    groups: list[str] = []
+    qs: list[dict] = []
+    cur: dict | None = None
+    grp: str | None = None
+
+    def flush() -> None:
+        nonlocal cur
+        if cur and cur["stem"]:
+            cur["stem"] = "\n".join(cur["stem"]).strip()
+            qs.append(cur)
+        cur = None
+
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        m = Q_RE.match(line)
+        if m:
+            flush()
+            meta = m.group(3)
+            pm = re.search(r"(?:\d+\s*/\s*)?(\d+)\s*分", meta)
+            cur = {
+                "n": int(m.group(1)),
+                "group": grp,
+                "type": Q_TYPES.get(m.group(2).strip(), m.group(2).strip()),
+                "points": int(pm.group(1)) if pm else 1,
+                "stem": [],
+                "choices": [],
+            }
+            continue
+        m = GROUP_RE.match(line)
+        if m:
+            flush()
+            grp = m.group(1).strip()
+            if grp not in groups:
+                groups.append(grp)
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if not s or s == "---":
+            continue
+        if s.startswith("填写你的答案"):
+            continue
+        mo = OPT_RE.match(s)
+        if mo:
+            cur["choices"].append({"k": mo.group(1), "t": mo.group(2).strip()})
+            continue
+        cur["stem"].append(s)
+    flush()
+    if not qs:
+        # 严格格式（带分值）一个都没解析出来 → 按宽松格式再来一遍
+        grp2 = None
+        for raw in text.splitlines():
+            line = raw.rstrip()
+            g = GROUP_RE.match(line)
+            if g:
+                grp2 = g.group(1).strip()
+                if grp2 not in groups:
+                    groups.append(grp2)
+                continue
+            q = Q_RE_LOOSE.match(line)
+            if q and q.group(2):
+                qs.append({
+                    "n": int(q.group(1)),
+                    "group": grp2,
+                    "type": "fill",
+                    "points": 1,
+                    "stem": q.group(2).strip(),
+                    "choices": [],
+                })
+    return groups, qs
+
+
+def match_evi(name: str, evi_files: list[str]) -> str | None:
+    """把题干里提到的文件名对到 evi/ 里的实际文件。
+
+    这套检材按人名分子目录（黄志远/phone.E01、方俊郎/phone.E01），
+    仅比 stem 会把两个 phone.E01 混掉，所以先比「完整相对路径」：
+        题干 "黄志远phone.E01"  →  归一化 "黄志远phonee01"
+        evi  "黄志远/phone.E01" →  归一化 "黄志远phonee01"   ← 精确命中
+    """
+    raw = str(name).strip().strip("`*")
+    n_full = norm_name(raw)
+    n_stem = norm_name(Path(raw).stem)
+    if not n_full:
+        return None
+
+    # ① 完整路径精确匹配
+    for f in evi_files:
+        if norm_name(f) == n_full:
+            return f
+    # ② 双向包含：「分析黄志远phone.E01」→ 去掉动词前缀后等于路径
+    hits = [f for f in evi_files if n_full and n_full in norm_name(f)]
+    if len(hits) == 1:
+        return hits[0]
+    hits = [f for f in evi_files if n_full.endswith(norm_name(f))]
+    if len(hits) == 1:
+        return hits[0]
+    # ③ 退回 stem 匹配
+    if n_stem:
+        for f in evi_files:
+            if norm_name(Path(f).stem) == n_stem:
+                return f
+        hits = [f for f in evi_files if n_stem in norm_name(Path(f).stem)]
+        if hits:
+            return min(hits, key=len)
+
+    # ④ 模糊兜底：题干里的名字常有错别字（方俊**朗** vs 目录方俊**郎**）。
+    #    按字符重合度打分，要求唯一最高且重合 ≥80%。
+    import difflib
+    scored = []
+    for f in evi_files:
+        ratio = difflib.SequenceMatcher(None, n_full, norm_name(f)).ratio()
+        if ratio >= 0.8:
+            scored.append((ratio, f))
+    if scored:
+        scored.sort(reverse=True)
+        if len(scored) == 1 or scored[0][0] - scored[1][0] > 0.05:
+            return scored[0][1]
+    return None
+
+
+DEVICE_KW = {
+    "手机": ("手机", "phone"), "手表": ("手表", "watch"), "手环": ("手环", "band"),
+    "PC": ("pc", "PC"), "电脑": ("pc", "PC"), "笔记本": ("pc", "PC"),
+    "U盘": ("udisk", "u盘", "usb"), "移动介质": ("udisk", "u盘"),
+    "车": ("car", "车机"), "服务器": ("server", "服务器"),
+    "内存": ("mem", "memory", "memdump"),
+}
+
+
+def match_cn(token: str, evi_files: list[str]) -> str | None:
+    """中文简称 → 检材。处理「林小婉手机」「林小碗手表」(含错别字) 这类写法。
+
+    打分：题干 token 与 evi 路径的汉字/字母重叠数，要求同时命中
+    「人名片段」和「设备关键词」，且最高分唯一。
+    """
+    import re as _re
+    tok = _re.sub(r"[检材分析请指出请问是多少什么]", "", token)
+    if len(tok) < 2:
+        return None
+    kw = next((v for k, v in DEVICE_KW.items() if k in token), None)
+    best, best_score = [], 0
+    for f in evi_files:
+        low = f.lower()
+        score = 0
+        if kw and any(x.lower() in low for x in kw):
+            score += 3
+        # 人名/表名重叠（去掉设备词后剩下的字）
+        core = token
+        for k in DEVICE_KW:
+            core = core.replace(k, "")
+        for ch in set(core):
+            if ch in f:
+                score += 1
+        if score > best_score:
+            best, best_score = [f], score
+        elif score == best_score and score > 0:
+            best.append(f)
+    if best_score >= 4 and len(best) == 1:
+        return best[0]
+    return None
+
+
+def resolve_artifacts(qs: list[dict], evi_files: list[str], manual: dict[str, str]) -> dict[str, str | None]:
+    """每个分组 → 一个检材。优先 `请你使用 `X``，其次组内提到最多且能对上 evi 的文件。"""
+    by_group: dict[str, list[dict]] = collections.OrderedDict()
+    for q in qs:
+        by_group.setdefault(q["group"] or "未分组", []).append(q)
+    out: dict[str, str | None] = {}
+    for g, items in by_group.items():
+        if g in manual:
+            out[g] = match_evi(manual[g], evi_files) or manual[g]
+            continue
+        text = "\n".join(q["stem"] for q in items)
+        cand = None
+        m = re.search(r"请你使用\s*`([^`]+)`", text)
+        if m:
+            cand = match_evi(m.group(1), evi_files)
+        if not cand:
+            cnt = collections.Counter(FILE_RE.findall(text))
+            for name, _ in cnt.most_common():
+                cand = match_evi(name, evi_files)
+                if cand:
+                    break
+        if not cand:
+            # 题干用 **加粗** 标注检材时（如「请根据参赛材料 **VTM-1**」），反引号正则抓不到
+            for name in re.findall(r"\*\*([^*\n]{2,40})\*\*", text):
+                cand = match_evi(name, evi_files)
+                if cand:
+                    break
+        if not cand:
+            # 最后兜底：分组名本身往往就是检材名（## VTM-1 ↔ VTM-1.zip）
+            cand = match_evi(g, evi_files)
+        out[g] = cand
+    # 只有一个检材的 case：没绑上的题直接绑它（省掉人工 --map）
+    only_art = evi_files[0] if len(evi_files) == 1 else None
+
+    # ---- 逐题绑定：题干里明确点名了检材就用它（一套题里混多个人时必需）----
+    prev = None
+    for q in qs:
+        stem = q.get("stem") or ""
+        hit = None
+        # ① 题干里带扩展名的完整文件名
+        for token in re.findall(r"([\u4e00-\u9fa5A-Za-z0-9_.\-/]{3,60}\.(?:E01|e01|img|IMG|zip|bin|mem|raw|dd))", stem):
+            # 正则贪婪会把「分析」也吞进来，先剥掉常见动词前缀
+            token = re.sub(r"^(分析|查看|根据|参考|请|对|从|在)+", "", token)
+            hit = match_evi(token, evi_files)
+            if hit:
+                break
+        # ② 中文简称：「分析林小婉手机检材」「林小碗手表」（含错别字）
+        if not hit:
+            for token in re.findall(r"分析([\u4e00-\u9fa5A-Za-z]{2,12}?)(?:检材|的)", stem) + \
+                         re.findall(r"([\u4e00-\u9fa5]{2,4}(?:手机|手表|手环|U盘|车|电脑|PC))", stem):
+                hit = match_cn(token, evi_files)
+                if hit:
+                    break
+        # ③ 承上题：继承上一题
+        if not hit and re.match(r"^(接上题|承接上题|𠄘上题)", stem):
+            hit = prev
+        if not hit:
+            hit = only_art
+        if hit:
+            q["artifact"] = hit
+            prev = hit
+        elif not re.match(r"^(接上题|承接上题|𠄘上题)", stem):
+            prev = None
+    return out
+
+
+def skills_for(artifact: str | None) -> list[str]:
+    if not artifact:
+        return []
+    low = artifact.lower()
+    if low.endswith((".pcap", ".pcapng")):
+        return ["pcap"]
+    if low.endswith((".e01", ".dd", ".raw", ".img", ".bin", ".vhd", ".vmdk")):
+        return ["disk"]
+    if low.endswith((".zip", ".7z", ".rar", ".tar", ".gz")):
+        return ["mobile"]
+    return []
+
+
+def evi_index(c: Case) -> dict[str, int]:
+    """evi/ 里每个文件的大小（跟随软链）。"""
+    out: dict[str, int] = {}
+    if not c.evi.is_dir():
+        return out
+    for p in sorted(c.evi.rglob("*")):
+        if p.is_file():
+            try:
+                rel = str(p.relative_to(c.evi))
+                out[rel] = p.stat().st_size
+            except OSError:
+                pass
+    return out
+
+
+def cmd_import(c: Case, a: argparse.Namespace) -> None:
+    src = Path(a.path)
+    if not src.is_absolute():
+        src = c.root / a.path if (c.root / a.path).exists() else c.meta / a.path
+    if not src.is_file():
+        die(f"找不到题目文件: {src}")
+    groups, qs = parse_question_md(src.read_text(encoding="utf-8", errors="replace"))
+    if not qs:
+        die("没解析出题目。检查格式：`## 分组` + `### 1. 单选题（必答，0 / 1 分，未作答）`")
+
+    manual: dict[str, str] = {}
+    for spec in a.map or []:
+        if "=" not in spec:
+            die(f"--map 要写成 组名=文件名，收到: {spec}")
+        k, v = spec.split("=", 1)
+        manual[k.strip()] = v.strip()
+
+    sizes = evi_index(c)
+    mapping = resolve_artifacts(qs, list(sizes), manual)
+
+    print(f"解析 {src}: {len(groups)} 组 / {len(qs)} 题")
+    print("\n分组 → 检材:")
+    for g in groups or ["未分组"]:
+        art = mapping.get(g)
+        n = sum(1 for q in qs if q["group"] == g)
+        mark = "" if art else "   ← 没对上，用 --map 指定"
+        print(f"  {g:12s} {n:3d} 题  →  {art or '（无）'}{mark}")
+
+    types = collections.Counter(q["type"] for q in qs)
+    pts = sum(q["points"] for q in qs)
+    print(f"\n题型: " + "  ".join(f"{TYPE_CN.get(k, k)} {v}" for k, v in types.items()) + f"   总分 {pts}")
+
+    if a.dry_run:
+        print("\n--dry-run：没写库。")
+        return
+
+    c.db.execute("DELETE FROM questions")
+    for q in qs:
+        art = q.get("artifact") or mapping.get(q["group"] or "未分组")
+        c.db.execute(
+            """INSERT INTO questions(id,n,grp,artifact,skills,type,points,stem,choices,status,cost,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'todo',?,?)""",
+            (
+                f"Q{q['n']:02d}", q["n"], q["group"], art,
+                ",".join(skills_for(art)), q["type"], q["points"],
+                q["stem"], json.dumps(q["choices"], ensure_ascii=False),
+                sizes.get(art or "", 0), now(),
+            ),
+        )
+    c.db.commit()
+    export_questions(c, src, groups)
+    print(f"\n已导入 {len(qs)} 题 → evidence.db + meta/questions.json")
+    print("下一步: fcase board")
+
+
+def export_questions(c: Case, src: Path, groups: list[str]) -> None:
+    rows = c.db.execute("SELECT * FROM questions ORDER BY n").fetchall()
+    data = {
+        "case": c.root.name,
+        "source": str(src.relative_to(c.root)) if c.root in src.parents else str(src),
+        "exported_at": now(),
+        "groups": groups,
+        "questions": [
+            {
+                "id": r["id"], "n": r["n"], "group": r["grp"], "artifact": r["artifact"],
+                "skills": [s for s in (r["skills"] or "").split(",") if s],
+                "type": r["type"], "points": r["points"], "stem": r["stem"],
+                "choices": json.loads(r["choices"] or "[]"),
+                "status": r["status"], "cost": r["cost"],
+            }
+            for r in rows
+        ],
+    }
+    (c.meta / "questions.json").write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _answers_by_qid(c: Case) -> dict[str, sqlite3.Row]:
+    rows = c.db.execute("SELECT * FROM answers WHERE qid IS NOT NULL ORDER BY id").fetchall()
+    return {r["qid"]: r for r in rows}
+
+
+def cmdlog_age(c: Case, agent: str | None = None) -> float | None:
+    """距离最后一条 bash 命令过去多少秒（None = 没有记录）。
+
+    cmdlog 是 guard 每条命令都写一条，所以它比 agents.last_seen 更能反映"agent 是不是真的在动"：
+    last_seen 是调度器无条件刷的，进程假死也照跳。
+    """
+    p = c.meta / "cmdlog.jsonl"
+    if not p.is_file():
+        return None
+    try:
+        with p.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 8192))
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            rec = json.loads(line)
+            if agent is not None and rec.get("agent") != agent:
+                continue
+            ts = rec.get("ts")
+            if not ts:
+                continue
+            t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - t).total_seconds()
+        except (ValueError, AttributeError):
+            continue
+    return None
+
+
+def age_str(sec: float | None) -> str:
+    if sec is None:
+        return "—"
+    if sec < 60:
+        return f"{sec:.0f}秒"
+    if sec < 3600:
+        return f"{sec / 60:.0f}分"
+    return f"{sec / 3600:.1f}小时"
+
+
+def q_age(ts: str | None) -> float | None:
+    if not ts:
+        return None
+    try:
+        t = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - t).total_seconds()
+    except ValueError:
+        return None
+
+
+def _group_agent_header(c: Case) -> list[str]:
+    """看板头部：题组进度 + 正在跑的 agent。"""
+    out: list[str] = []
+    gs = c.db.execute("SELECT * FROM groups ORDER BY id").fetchall()
+    if gs:
+        done = sum(1 for g in gs if g["status"] == "done")
+        doing = [g["id"] for g in gs if g["status"] == "doing"]
+        out.append(f"题组 {done}/{len(gs)}" + (f"　进行中 {','.join(doing)}" if doing else ""))
+    ag = c.db.execute("SELECT * FROM agents WHERE status='running'").fetchall()
+    if ag:
+        for a in ag:
+            qs_ = q_age(a["q_started"])
+            idle = cmdlog_age(c, a["id"])
+            flag = "  ⚠ 可能卡住" if idle is not None and idle > 600 else ""
+            out.append(f"  {a['id']} {a['grp']} {a['model']} → {a['current_qid'] or '准备中'}"
+                       f"（已 {age_str(qs_)}）  上次命令 {age_str(idle)} 前{flag}")
+    blk = c.meta / "blocked.md"
+    if blk.is_file():
+        n = sum(1 for line in blk.read_text(encoding="utf-8").splitlines() if line.startswith("- [ ]"))
+        if n:
+            out.append(f"⚠ {n} 题待人工处理 → meta/blocked.md")
+    return out
+
+
+def cmd_board(c: Case, a: argparse.Namespace) -> None:
+    every = getattr(a, "watch", None)
+    if not every:
+        return _board_once(c)
+    import time as _t
+    try:
+        while True:
+            print("\033[2J\033[H", end="")          # 清屏 + 回首页
+            _board_once(c)
+            print(f"\n  ⟳ 每 {every}s 刷新（Ctrl-C 退出）", flush=True)
+            _t.sleep(max(2, int(every)))
+    except KeyboardInterrupt:
+        print("\n  停止刷新")
+
+
+def _board_once(c: Case) -> None:
+    qs = c.db.execute("SELECT * FROM questions ORDER BY n").fetchall()
+    if not qs:
+        die("还没有题目。先 fcase import meta/question.md")
+    for line in _group_agent_header(c):
+        print(line)
+    ans = _answers_by_qid(c)
+    grp = None
+    done = 0
+    for r in qs:
+        if r["grp"] != grp:
+            grp = r["grp"]
+            print(f"\n[{grp}]  {r['artifact'] or '（未绑定检材）'}")
+        ok = r["status"] == "done"
+        done += ok
+        a1 = ans.get(r["id"])
+        preview = (a1["answer"][:26] if a1 else "")
+        stem = r["stem"].replace("\n", " ")[:38]
+        print(f"  {r['id']} {STATUS_CN.get(r['status'], '?')} {TYPE_CN.get(r['type'], r['type']):4s} {stem:38s} {preview}")
+    total = len(qs)
+    print(f"\n进度 {done}/{total}" + (f"  还剩 {total - done} 题" if done < total else "  ★ 全答完"))
+
+
+def cmd_next(c: Case, a: argparse.Namespace) -> None:
+    sql = """SELECT * FROM questions WHERE status IN ('doing','todo')"""
+    args: list = []
+    if getattr(a, "group", None):
+        sql += " AND grp LIKE ?"
+        args.append(f"%{a.group}%")
+    # 默认按卷子顺序（n）。--by-size 才按检材体积排——体积只在「还没索引/还没 iLEAPP」时
+    # 才有参考价值，索引做完之后它只会把大包（冯子超 1.17G）无谓地排到最后。
+    order = "cost ASC, n ASC" if getattr(a, "by_size", False) else "n ASC"
+    want = getattr(a, "batch", 1) or 1
+    sql += f" ORDER BY (status='doing') DESC, {order} LIMIT {want}"
+    rows = c.db.execute(sql, args).fetchall()
+    if not rows:
+        die("没有待做的题了")
+    if want > 1:
+        # 只取同一组、题号连续的（「承上题」串在一起才有意义）
+        picked = [rows[0]]
+        for r in rows[1:]:
+            if r["grp"] != picked[0]["grp"]:
+                continue          # 别的组插进来（比如遗留的 doing）就跳过
+            if r["n"] != picked[-1]["n"] + 1:
+                break             # 题号断了，链条到此为止
+            picked.append(r)
+        print("\n".join(r["id"] for r in picked))
+    elif a.full:
+        show_question(c, rows[0]["id"])
+    else:
+        print(rows[0]["id"])
+
+
+def show_question(c: Case, qid: str) -> None:
+    r = c.db.execute("SELECT * FROM questions WHERE id=?", (qid.upper(),)).fetchone()
+    if r is None:
+        die(f"没有这道题: {qid}")
+    print(f"{r['id']}  [{r['grp']}]  {TYPE_CN.get(r['type'], r['type'])}题 {r['points']} 分  →  {r['artifact'] or '（未绑定检材）'}")
+    print("-" * 70)
+    print(r["stem"])
+    for ch in json.loads(r["choices"] or "[]"):
+        print(f"  {ch['k']}. {ch['t']}")
+    finds = c.db.execute("SELECT * FROM findings WHERE qid=? ORDER BY id", (r["id"],)).fetchall()
+    if finds:
+        print(f"\n已有线索（{len(finds)} 条）:")
+        for f in finds:
+            loc = f"  @{f['locator']}" if f["locator"] else ""
+            print(f"  #{f['id']} [{f['kind']}] {f['text']}{loc}")
+    dead = c.db.execute("SELECT * FROM deadends WHERE qid=? ORDER BY id", (r["id"],)).fetchall()
+    if dead:
+        print(f"\n死路（别重走）:")
+        for d in dead:
+            print(f"  - {d['text']}")
+    ans = c.db.execute("SELECT * FROM answers WHERE qid=? ORDER BY id DESC LIMIT 1", (r["id"],)).fetchone()
+    if ans:
+        print(f"\n已答: {ans['answer']}  （置信度 {ans['confidence']}）")
+
+
+def cmd_show(c: Case, a: argparse.Namespace) -> None:
+    show_question(c, a.qid)
+
+
+def cmd_mark(c: Case, a: argparse.Namespace) -> None:
+    qid = a.qid.upper()
+    if a.status not in {"todo", "doing", "done", "blocked"}:
+        die("状态只能是 todo/doing/done/blocked")
+    cur = c.db.execute("UPDATE questions SET status=? WHERE id=?", (a.status, qid))
+    c.db.commit()
+    if cur.rowcount == 0:
+        die(f"没有这道题: {qid}")
+    print(f"{qid} → {a.status}")
+
+
+def cmd_deadend(c: Case, a: argparse.Namespace) -> None:
+    cur = c.db.execute(
+        "INSERT INTO deadends(qid,text,created_at) VALUES(?,?,?)",
+        (a.q.upper() if a.q else None, a.text, now()),
+    )
+    c.db.commit()
+    print(f"deadend #{cur.lastrowid} 记下了（下次 brief 会带上，不会再走）")
+
+
+def pending_path(c: Case) -> Path:
+    return c.meta / "pending-install.md"
+
+
+def cmd_need(c: Case, a: argparse.Namespace) -> None:
+    p = pending_path(c)
+    new = not p.exists()
+    with p.open("a", encoding="utf-8") as f:
+        if new:
+            f.write("# 待人工安装\n\nagent 不会自己装。看到这条就停下等人处理。\n")
+        f.write(f"\n## {now()}\n\n- 需要：`{a.pkg}`\n")
+        if a.reason:
+            f.write(f"- 原因：{a.reason}\n")
+        if a.q:
+            f.write(f"- 题目：{a.q.upper()}\n")
+    print(f"已记入 {p.relative_to(c.root)}。现在停下，告诉用户要装什么、为什么、有没有不装的办法。")
+
+
+def cmd_pending(c: Case, a: argparse.Namespace) -> None:
+    p = pending_path(c)
+    if not p.exists():
+        print("没有待安装项。")
+        return
+    print(p.read_text(encoding="utf-8"))
+
+
+# ── index：检材索引 ───────────────────────────────────────────────────────────
+# 目的：让模型用一次 read 拿到「钱在哪、库在哪、装了什么、时间范围」，
+# 而不是 find 全盘 42 分钟。产出 meta/index/<stem>.json，2–6KB。
+
+DB_HINTS = [
+    (r"sms\.db$|sms\.sqlite", "短信"),
+    (r"CallHistory", "通话记录"),
+    (r"AddressBook", "通讯录"),
+    (r"ChatStorage|msgstore|wa\.db|WhatsApp", "WhatsApp"),
+    (r"MM\.sqlite|WCDB|message_[0-9]", "微信"),
+    (r"History\.db$|Safari", "浏览器历史"),
+    (r"NoteStore|notes\.sqlite", "备忘录"),
+    (r"Calendar", "日历"),
+    (r"PhotoData|Photos\.sqlite", "照片"),
+    (r"accounts3?\.sqlite|Accounts", "账号"),
+    (r"locationd|Cache\.db$", "位置"),
+    (r"keychain|KeyChain", "钥匙串"),
+    (r"healthdb|Health", "健康"),
+    (r"Mail|Envelope", "邮件"),
+]
+
+KEY_FILE_HINTS = [
+    (r"iDevice_info\.txt$", "设备信息（IMEI/ICCID/蓝牙/MAC）"),
+    (r"com\.apple\.wifi\.known-networks\.plist$", "已保存的 WiFi 网络（SSID 列表）"),
+    (r"SystemConfiguration/com\.apple\.wifi\.plist$", "当前/历史 WiFi 配置（SSID）"),
+    (r"keychain-backup\.plist$", "钥匙串备份（WiFi/账号密码，可解加密备份）"),
+    (r"keychain-2\.db$", "钥匙串数据库"),
+    (r"com\.apple\.MobileInternetSharing", "个人热点设置"),
+    (r"com\.apple\.MobileBluetooth", "蓝牙"),
+    (r"com\.apple\.accounts", "Apple ID"),
+    (r"com\.apple\.MobileSMS\.plist$", "短信设置"),
+    (r"com\.apple\.mobilesafari", "Safari"),
+    (r"com\.apple\.springboard", "桌面/图标"),
+    (r"KeyChain\.json$", "钥匙串导出"),
+    (r"Manifest\.db$", "文件索引（backup）"),
+    (r"package\.xml$", "Android 包清单"),
+]
+
+DEVICE_KEYS = [
+    "ProductVersion", "BuildVersion", "ProductType", "DeviceName", "DeviceClass",
+    "SerialNumber", "UniqueDeviceID", "HardwareModel", "CPUArchitecture", "RegionInfo",
+    "TimeZone", "ActivationState", "BluetoothAddress", "EthernetAddress", "WiFiAddress",
+    "InternationalMobileEquipmentIdentity", "InternationalMobileEquipmentIdentity2",
+    "MobileEquipmentIdentifier", "IntegratedCircuitCardIdentity",
+    "InternationalMobileSubscriberIdentity", "PhoneNumber", "MobileSubscriberCountryCode",
+    "MobileSubscriberNetworkCode", "PasscodeProtected", "PasswordProtected",
+]
+
+
+def _why(path: str, table: list[tuple[str, str]]) -> str | None:
+    for pat, why in table:
+        if re.search(pat, path, re.I):
+            return why
+    return None
+
+
+def _run(cmd: list[str], timeout: int = 120) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, errors="replace")
+        return (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"<{type(e).__name__}: {e}>"
+
+
+def _parse_idevice(text: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z][A-Za-z0-9]*):[ \t]*(.*)$", line)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2).strip()
+        if k in DEVICE_KEYS and v:
+            out.setdefault(k, []).append(v)
+    return out
+
+
+def _plist_from_zip(z: zipfile.ZipFile, name: str) -> dict:
+    try:
+        d = plistlib.loads(z.read(name))
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def index_zip(path: Path) -> dict:
+    idx: dict = {"artifact": path.name, "bytes": path.stat().st_size}
+    try:
+        z = zipfile.ZipFile(path)
+    except Exception as e:
+        return {**idx, "kind": "zip?", "error": f"{type(e).__name__}: {e}"}
+
+    infos = z.infolist()
+    names = [i.filename for i in infos]
+    top = collections.Counter(n.split("/")[0] for n in names if n.split("/")[0])
+    is_ios = any(n.endswith("iDevice_info.txt") for n in names) or any(n.startswith("var/mobile/") for n in names[:200])
+    idx["kind"] = "ios-dump" if is_ios else "zip"
+    idx["structure"] = {
+        "entries": len(infos),
+        "uncompressed": sum(i.file_size for i in infos),
+        "top": dict(top.most_common(10)),
+    }
+    dates = [i.date_time for i in infos if i.date_time[0] > 1980]
+    if dates:
+        fmt = lambda t: "%04d-%02d-%02d %02d:%02d" % tuple(t[:5])
+        idx["time_range"] = {"min": fmt(min(dates)), "max": fmt(max(dates)), "note": "zip 条目时间，仅供参考"}
+
+    # ① iOS 备份的 var/Info.plist —— 答案密度最高的一份文件
+    for cand in ("var/Info.plist", "Info.plist"):
+        d = _plist_from_zip(z, cand)
+        if d:
+            apps = d.get("Applications") or {}
+            idx["info_plist"] = {
+                "_path": cand,
+                "ProductVersion": d.get("Product Version"),
+                "BuildVersion": d.get("Build Version"),
+                "DeviceName": d.get("Device Name"),
+                "ProductType": d.get("Product Type"),
+                "SerialNumber": d.get("Serial Number"),
+                "IMEI": d.get("IMEI"),
+                "MEID": d.get("MEID"),
+                "ICCID": d.get("ICCID"),
+                "UniqueIdentifier": d.get("Unique Identifier"),
+                "LastBackupDate": str(d.get("Last Backup Date")),
+                "apps_count": len(apps),
+                "apps": sorted(apps)[:60] if apps else [],
+            }
+            break
+
+    for cand in ("var/Manifest.plist", "Manifest.plist"):
+        d = _plist_from_zip(z, cand)
+        if d:
+            idx["manifest_plist"] = {
+                "_path": cand,
+                "IsEncrypted": d.get("IsEncrypted"),
+                "WasPasscodeSet": d.get("WasPasscodeSet"),
+                "Date": str(d.get("Date")),
+                "Version": d.get("Version"),
+            }
+            break
+
+    # ② iDevice_info.txt —— IMEI/ICCID/蓝牙/MAC
+    for n in names:
+        if n.endswith("iDevice_info.txt"):
+            try:
+                txt = z.read(n).decode("utf-8-sig", errors="replace")
+            except Exception:
+                continue
+            dev = _parse_idevice(txt)
+            if dev:
+                idx["device_info"] = {"_path": n, **dev}
+            break
+
+    # ③ 应用目录
+    appdirs: collections.Counter = collections.Counter()
+    for n in names:
+        m = re.match(r"^(?:var/mobile/)?Applications/([^/]+)/", n)
+        if m:
+            appdirs[m.group(1)] += 1
+    if appdirs:
+        idx["apps"] = {"count": len(appdirs), "top": dict(appdirs.most_common(40))}
+
+    # ④ 数据库
+    dbs: list[tuple[str, int, str | None]] = []
+    for i in infos:
+        n = i.filename
+        if i.is_dir() or not re.search(r"\.(db|sqlite3?|storedata|sqlitedb|realm)$", n, re.I):
+            continue
+        if i.file_size < 1024:
+            continue
+        dbs.append((n, i.file_size, _why(n, DB_HINTS)))
+    dbs.sort(key=lambda t: (-(t[2] is not None), -t[1]))
+    idx["databases"] = {
+        "count": len(dbs),
+        "note": "有用途标签的优先，再按体积，只列前 25",
+        "items": [{"path": n, "bytes": b, **({"why": w} if w else {})} for n, b, w in dbs[:25]],
+    }
+
+    # ⑤ 关键文件（每个用途最多留 3 个，跳过缓存噪音）
+    key: list[dict] = []
+    seen: collections.Counter = collections.Counter()
+    for i in infos:
+        if i.is_dir() or re.search(r"/Caches?/|/metadata$|EmojiCache", i.filename):
+            continue
+        w = _why(i.filename, KEY_FILE_HINTS)
+        if not w or seen[w] >= 2:
+            continue
+        seen[w] += 1
+        key.append({"path": i.filename, "bytes": i.file_size, "why": w})
+    # 按 KEY_FILE_HINTS 的先后排优先级：设备信息/WiFi/钥匙串排前面，别被 Safari 噪音挤掉
+    prio = {why: n for n, (_, why) in enumerate(KEY_FILE_HINTS)}
+    key.sort(key=lambda k: prio.get(k["why"], 99))
+    idx["key_files"] = key[:18]
+
+    # ⑥ 最大的文件（找视频/图片/加密钱包）
+    big = sorted((i for i in infos if not i.is_dir()), key=lambda i: -i.file_size)[:10]
+    idx["largest"] = [{"path": i.filename, "bytes": i.file_size} for i in big]
+
+    idx["hint"] = [
+        f"抽单个文件：`unzip -p evi/{path.name} <路径> > work/x`（不用整包解压）",
+        "看库：`sqlite3 work/x .tables`，行数用 `select count(*)`，别 dump 全表",
+    ]
+    return idx
+
+
+def index_dir(path: Path) -> dict:
+    idx: dict = {"artifact": path.name + "/", "kind": "dir"}
+    files = 0
+    total = 0
+    byext: collections.Counter = collections.Counter()
+    dbs: list[tuple[str, int, str | None]] = []
+    key: list[dict] = []
+    for root, dirs, fs in os.walk(path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")][:200]
+        for f in fs:
+            fp = os.path.join(root, f)
+            try:
+                sz = os.path.getsize(fp)
+            except OSError:
+                continue
+            files += 1
+            total += sz
+            byext[Path(f).suffix.lower()[:12] or "(无)"] += 1
+            rel = os.path.relpath(fp, path)
+            if re.search(r"\.(db|sqlite3?|storedata|sqlitedb|realm)$", f, re.I) and sz > 1024:
+                dbs.append((rel, sz, _why(rel, DB_HINTS)))
+            w = _why(rel, KEY_FILE_HINTS)
+            if w:
+                key.append({"path": rel, "bytes": sz, "why": w})
+    idx["structure"] = {"files": files, "bytes": total, "by_ext": dict(byext.most_common(12))}
+    dbs.sort(key=lambda t: (-(t[2] is not None), -t[1]))
+    idx["databases"] = {"count": len(dbs),
+                        "items": [{"path": n, "bytes": b, **({"why": w} if w else {})} for n, b, w in dbs[:30]]}
+    idx["key_files"] = key[:25]
+    return idx
+
+
+def index_disk(path: Path) -> dict:
+    idx: dict = {"artifact": path.name, "bytes": path.stat().st_size, "kind": "disk"}
+    out = _run(["mmls", str(path)], timeout=180)
+    parts = []
+    for line in out.splitlines():
+        m = re.match(r"^\s*(\d+):\s+(\S+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(.*)$", line)
+        if m:
+            parts.append({"slot": m.group(1), "start": int(m.group(3)), "end": int(m.group(4)),
+                          "length": int(m.group(5)), "offset_bytes": int(m.group(3)) * 512,
+                          "desc": m.group(6).strip()})
+    idx["partitions"] = parts
+    if not parts:
+        # 没有分区表 → 可能整份就是单个文件系统卷（COM-01.e01 / FC-01.bin 都是这种）
+        fs = _run(["fsstat", str(path)], timeout=180)
+        m = re.search(r"File System Type:\s*(\S+)", fs)
+        if m:
+            idx["kind"] = "volume"
+            idx["fs"] = m.group(1)
+            serial = re.search(r"Volume Serial Number:\s*(\S+)", fs)
+            if serial:
+                idx["volume_serial"] = serial.group(1)
+            idx["partitions"] = [{
+                "slot": "000", "start": 0, "end": 0, "length": 0, "offset_bytes": 0,
+                "desc": f"{m.group(1)} 卷（无分区表，直接 -o 0）",
+            }]
+        else:
+            idx["mmls_raw"] = "\n".join(out.splitlines()[:12])
+    idx["file_type"] = _run(["file", "-b", str(path)], timeout=60).strip()[:200]
+    idx["hint"] = [
+        "分区偏移（字节）= start × 512",
+        "`fls -o <start> -r -p image | rg 关键词`，别整盘 ls",
+        "`fsstat -o <start> image` 看文件系统时间范围",
+    ]
+    return idx
+
+
+def index_pcap(path: Path) -> dict:
+    idx: dict = {"artifact": path.name, "bytes": path.stat().st_size, "kind": "pcap"}
+    idx["capinfos"] = _run(["capinfos", "-c", "-a", "-e", "-M", str(path)], timeout=120).strip()[:1500]
+    idx["protocols"] = _run(["tshark", "-r", str(path), "-q", "-z", "io,phs"], timeout=180).strip()[:1500]
+    return idx
+
+
+IMG_EXT = {".e01", ".dd", ".raw", ".img", ".bin", ".001", ".vhd", ".vmdk", ".qcow2"}
+MEM_HINT = ("_ram", "memory", "memdump", "ram_")
+
+
+def unpacked_dir(c: Case, artifact: str) -> Path | None:
+    """解包后的目录：work/unpack/<stem>/ 或 work/<stem>/。"""
+    stem = Path(artifact).stem
+    for d in (c.work / "unpack" / stem, c.work / stem):
+        if d.is_dir():
+            return d
+    return None
+
+
+def find_image(c: Case, artifact: str) -> Path | None:
+    """在解包目录里找磁盘镜像（排除内存镜像）。"""
+    d = unpacked_dir(c, artifact)
+    if d is None:
+        return None
+    best: Path | None = None
+    for f in d.rglob("*"):
+        try:
+            if not f.is_file() or f.suffix.lower() not in IMG_EXT:
+                continue
+            low = f.name.lower()
+            if any(h in low for h in MEM_HINT):
+                continue          # COM-01_ram.raw 是内存镜像，不是磁盘
+            if f.stat().st_size < (16 << 20):
+                continue
+        except OSError:
+            continue
+        if best is None or f.stat().st_size > best.stat().st_size:
+            best = f
+    return best
+
+
+def idx_name(art: str) -> str:
+    """索引文件名：用归一化的完整相对路径，避免 黄志远/phone.E01 和 方俊郎/phone.E01 撞车。"""
+    full = str(Path(art).with_suffix(""))
+    n = norm_name(full)
+    return n or Path(art).stem
+
+
+def build_index(c: Case, artifact: str, deep: bool = False) -> dict:
+    src = c.evi / artifact
+    if not src.exists():
+        return {"artifact": artifact, "error": "evi/ 里没有这个文件"}
+    unpacked = unpacked_dir(c, artifact)
+    img = find_image(c, artifact)
+    if img is not None:
+        # 解包出来的是磁盘镜像 → 建分区索引（这才是 agent 真正要的）
+        idx = index_disk(img)
+        idx["artifact"] = artifact
+        try:
+            idx["indexed_from"] = str(img.relative_to(c.root))
+        except ValueError:
+            idx["indexed_from"] = str(img)
+        if src.suffix.lower() == ".zip":
+            try:
+                idx["container"] = index_zip(src).get("structure")
+            except Exception:
+                pass
+    elif unpacked is not None and not deep:
+        idx = index_dir(unpacked)
+        idx["artifact"] = artifact
+        try:
+            idx["indexed_from"] = str(unpacked.relative_to(c.root)) + "/（已解包）"
+        except ValueError:
+            idx["indexed_from"] = str(unpacked)
+    elif src.suffix.lower() == ".zip":
+        idx = index_zip(src)
+        idx["source"] = f"evi/{artifact}"
+    elif src.suffix.lower() in {".e01", ".dd", ".raw", ".img", ".bin", ".001"}:
+        idx = index_disk(src)
+        idx["source"] = f"evi/{artifact}"
+    elif src.suffix.lower() in {".pcap", ".pcapng", ".cap"}:
+        idx = index_pcap(src)
+        idx["source"] = f"evi/{artifact}"
+    else:
+        idx = {
+            "artifact": artifact,
+            "bytes": src.stat().st_size,
+            "kind": "other",
+            "file_type": _run(["file", "-b", str(src)], timeout=60).strip()[:200],
+            "strings_head": _run(["strings", "-n", "8", str(src)], timeout=60)[:800],
+            "source": f"evi/{artifact}",
+        }
+    idx["generated_at"] = now()
+    _attach_lava(c, artifact, idx)
+    return idx
+
+
+def _attach_lava(c: Case, artifact: str, idx: dict) -> None:
+    """iLEAPP 跑过的话，把它的产物库挂进索引。
+
+    iLEAPP 把 1300+ 个 artifact 解析成一张 SQLite（_lava_artifacts.db），
+    每类一张表。比翻 HTML 快一个数量级，直接 sqlite3 查。
+    """
+    stem = Path(artifact).stem
+    cands = sorted((c.work).glob(f"ileapp_{stem}/iLEAPP_Output_*/_lava_artifacts.db"))
+    if not cands:
+        return
+    db = cands[-1]
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        tabs = [
+            r[0]
+            for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE '\\_%' ESCAPE '\\'"
+            )
+        ]
+        counts = {}
+        for t in tabs:
+            try:
+                n = con.execute(f'SELECT count(*) FROM "{t}"').fetchone()[0]
+            except sqlite3.Error:
+                continue
+            if n > 0:
+                counts[t] = n
+        con.close()
+    except sqlite3.Error as e:
+        idx["lava"] = {"db": str(db.relative_to(c.root)), "error": str(e)}
+        return
+    top = dict(sorted(counts.items(), key=lambda kv: -kv[1])[:50])
+    idx["lava"] = {
+        "db": str(db.relative_to(c.root)),
+        "tables_nonempty": len(counts),
+        "tables": top,
+        "hint": f'sqlite3 "{db.relative_to(c.root)}" "SELECT * FROM <表名> LIMIT 20"',
+    }
+
+
+def cmd_index(c: Case, a: argparse.Namespace) -> None:
+    sizes = evi_index(c)
+    if a.artifact in (None, "all"):
+        targets = list(sizes)
+    elif a.artifact in sizes:
+        targets = [a.artifact]
+    else:
+        targets = [n for n in sizes if Path(n).stem == a.artifact or n.startswith(a.artifact)]
+        if not targets:
+            die(f"evi/ 里没有 {a.artifact}。现有：{', '.join(sizes) or '（空）'}")
+    if not targets:
+        die("evi/ 是空的")
+    outdir = c.meta / "index"
+    outdir.mkdir(exist_ok=True)
+    for name in targets:
+        idx = build_index(c, name, deep=a.deep)
+        dest = outdir / f"{idx_name(name)}.json"
+        dest.write_text(json.dumps(idx, ensure_ascii=False, indent=1), encoding="utf-8")
+        bits = []
+        ip = idx.get("info_plist")
+        if ip:
+            bits.append(f"iOS {ip.get('ProductVersion')} · IMEI {ip.get('IMEI')} · 应用 {ip.get('apps_count')}")
+        if "device_info" in idx:
+            bits.append(f"设备键 {len([k for k in idx['device_info'] if not k.startswith('_')])}")
+        if idx.get("partitions"):
+            bits.append(f"分区 {len(idx['partitions'])}")
+        if "databases" in idx:
+            bits.append(f"库 {idx['databases'].get('count')}")
+        if "apps" in idx:
+            bits.append(f"应用 {idx['apps'].get('count')}")
+        print(f"  {name:26s} → meta/index/{dest.name}  ({dest.stat().st_size / 1024:.1f}KB)  " + " · ".join(bits))
+    print("\n读法：`read meta/index/<检材>.json`。别 find 全盘。")
+
+
+def cmd_map(c: Case, a: argparse.Namespace) -> None:
+    """把某组题目重新绑到某个检材。"""
+    cur = c.db.execute("UPDATE questions SET artifact=? WHERE grp=?", (a.artifact, a.group))
+    c.db.commit()
+    groups = [r["grp"] for r in c.db.execute("SELECT DISTINCT grp FROM questions")]
+    export_questions(c, c.meta / "question.md", groups)
+    print(f"{a.group} → {a.artifact}（{cur.rowcount} 题）")
+
+
+def cmd_brief(c: Case, a: argparse.Namespace) -> None:
+    qids = [q.upper() for q in a.qids]
+    rows = []
+    for qid in qids:
+        r = c.db.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+        if r is None:
+            die(f"没有这道题: {qid}")
+        rows.append(r)
+    bdir = c.meta / "briefs"
+    bdir.mkdir(exist_ok=True)
+
+    batch = len(rows) > 1
+    first, last = rows[0]["id"], rows[-1]["id"]
+    dest = bdir / (f"batch-{first}-{last}.md" if batch else f"{first}.md")
+    arts = sorted({r["artifact"] for r in rows if r["artifact"]})
+
+    # ★ 只喂「当前 attempt」的线索：换模型重做时，上一轮的错误结论不能污染这一轮。
+    #   旧线索不删，`fcase why` 里能看到全部历史。
+    latest = {q: current_attempt(c, q) for q in qids}
+    _all = c.db.execute(
+        "SELECT * FROM findings WHERE qid IN (%s) ORDER BY id" % ",".join("?" * len(qids)), qids
+    ).fetchall()
+    finds = [f for f in _all if (f["attempt"] or 0) >= latest.get(f["qid"], 0)]
+    stale_n = len(_all) - len(finds)
+    dead = c.db.execute(
+        "SELECT * FROM deadends WHERE qid IN (%s) ORDER BY id" % ",".join("?" * len(qids)), qids
+    ).fetchall()
+
+    L = [f"# {first}–{last} 作战简报（{len(rows)} 题）" if batch else f"# {first} 作战简报", "",
+         f"- 分组：{rows[0]['grp']}",
+         "- 检材：" + ("、".join(f"`evi/{x}`" for x in arts) if arts else "（未绑定）"),
+         f"- 题型：{' / '.join(sorted({TYPE_CN.get(r['type'], r['type']) for r in rows}))}",
+         f"- 总分：{sum(r['points'] for r in rows)} 分",
+         f"- 技能：{rows[0]['skills'] or '（按检材自行判断）'}", ""]
+
+    sf = c.meta / "stage.json"
+    staged = {}
+    if sf.is_file():
+        try:
+            staged = json.loads(sf.read_text(encoding="utf-8"))
+        except ValueError:
+            staged = {}
+    if arts and any(x in staged for x in arts):
+        L += ["## 工作副本（读这里）", ""]
+        for art in arts:
+            if art in staged:
+                L.append(f"- `{art}` -> `{staged[art]}`")
+        L += ["", "> 原始目录在 9p 上随机读极慢（fls -r 180 秒跑不完），原生盘 16 秒。", ""]
+
+    # 已解包的文件：E01/bin 都在 work/unpack/<stem>/ 下，不告诉 agent 它会满盘找
+    if arts:
+        unpacked_lines = []
+        for art in arts:
+            d = c.work / "unpack" / Path(art).stem
+            if not d.is_dir():
+                continue
+            files = [f for f in d.rglob("*") if f.is_file() and f.stat().st_size > 1 << 20]
+            for f in sorted(files, key=lambda x: -x.stat().st_size)[:6]:
+                try:
+                    rel = f.relative_to(c.root)
+                except ValueError:
+                    rel = f
+                unpacked_lines.append(f"- `{rel}`  {human(f.stat().st_size)}")
+        if unpacked_lines:
+            L += ["## 已解包（镜像在这里，别去 evi/ 里找）", ""] + unpacked_lines + [""]
+
+    # 已经跑过 deep-index 的清单：必须告诉 agent，否则它会重跑 fls -r（一次 200 秒）
+    if arts:
+        listing_lines = []
+        for art in arts:
+            d = c.arts / idx_name(art)      # 必须和 art_dir() 一致，否则找不到清单
+            if not d.is_dir():
+                continue
+            for f in sorted(d.glob("*.txt")):
+                try:
+                    n = sum(1 for _ in f.open(encoding="utf-8", errors="replace"))
+                except OSError:
+                    continue
+                try:
+                    rel = f.relative_to(c.root)
+                except ValueError:
+                    rel = f
+                listing_lines.append(f"- `{rel}`  {n:,} 行")
+        if listing_lines:
+            L += ["## 已生成的清单（直接 rg / read，**不要重跑 fls -r**）", ""] + listing_lines
+            L += ["", "> `top-dirs.txt`=各目录文件数与体积（**先看这个，决定去哪找**）；"
+                      "`hives.txt`=注册表 hive 与事件日志；`ci-files.txt`=凭据/配置类；"
+                      "`databases.txt`=数据库/浏览器库；`media.txt`=图片视频；"
+                      "`ext-count.txt`=扩展名分布。", ""]
+
+    for art in arts:
+        base = c.arts / idx_name(art)
+        for hname in ("READ-HINT.txt", "READ-HINT-can.txt"):
+            hint = base / hname
+            if hint.is_file():
+                L += ["## ⚠ 该检材的读法（重要）", "",
+                      hint.read_text(encoding="utf-8", errors="replace").strip(), ""]
+
+    if arts:
+        L += ["## 检材索引", ""]
+        for art in arts:
+            idx = c.meta / "index" / f"{idx_name(art)}.json"
+            if idx.is_file():
+                L.append(f"- `{idx.relative_to(c.root)}`（先读这个，别 find 全盘）")
+            else:
+                L.append(f"- 未生成：先跑 `fcase index {art}`")
+        L.append("")
+
+    if batch:
+        L += [f"## 要答的 {len(rows)} 道题", ""]
+        for r in rows:
+            L += [f"### {r['id']}（{TYPE_CN.get(r['type'], r['type'])}，{r['points']} 分）", ""]
+            L += [r["stem"], ""]
+            chs = json.loads(r["choices"] or "[]")
+            if chs:
+                L += [f"- {ch['k']}. {ch['t']}" for ch in chs] + [""]
+    else:
+        r = rows[0]
+        L += ["## 题目", "", r["stem"], ""]
+        chs = json.loads(r["choices"] or "[]")
+        if chs:
+            L += ["## 选项", ""] + [f"- {ch['k']}. {ch['t']}" for ch in chs] + [""]
+
+    if stale_n:
+        L += [f"> 本题此前有 {stale_n} 条旧线索（来自更早的尝试），已归档不展示。",
+              "> 若怀疑旧结论有误，用 `fcase why " + qids[0] + "` 查看历史。", ""]
+    pf = c.meta / "probes" / f"{qids[0]}.md"
+    if len(qids) == 1 and pf.is_file():
+        L += ["## ★ 预计算候选表（脚本已排好序，直接用）", "",
+              f"完整内容在 `{pf.relative_to(c.root)}`，先读它。", "",
+              "> 这类题的错法是「看见第一个像样的答案就交卷」。表里的候选已经排好序，"
+              "取题目要的那个极值，不要自己重新找。", ""]
+
+    L += ["## 已有线索", ""]
+    L += [f"- [{f['kind']}] {f['text']}" + (f"  @`{f['locator']}`" if f["locator"] else "") for f in finds] or ["- （无，从零开始）"]
+    L.append("")
+
+    # ---- 跨检材联想 ----
+    # 只给本题检材的简报会让 agent “只盯着一个镜像硬砸”，而密码/密钥/账号这类
+    # 东西往往在别的检材里（聊天记录、便签、文件名）。这里把全案检材和
+    # 其他题目的线索压成一行一条，供它做关联。
+    all_arts = c.db.execute("SELECT * FROM artifacts ORDER BY size_bytes DESC").fetchall()
+    if len(all_arts) > 1:
+        L += ["## 全案检材（联想用）", ""]
+        for a in all_arts:
+            stem = Path(a["path"]).stem
+            kind = "?"
+            idxf = c.meta / "index" / f"{idx_name(a['path'])}.json"
+            if idxf.is_file():
+                try:
+                    kind = json.loads(idxf.read_text(encoding="utf-8")).get("kind") or kind
+                except (OSError, ValueError):
+                    pass
+            unpacked = ""
+            # work/ 里的目录名不一定等于检材 stem：CHAN_MH_mobile.zip → work/CHAN、
+            # work/ileapp_CHAN_MH_mobile。几种常见命名都试一下，命中就给路径。
+            for cand in (stem, stem.split("_")[0], f"ileapp_{stem}", f"ileapp_{stem.split('_')[0]}"):
+                if cand and (c.work / cand).is_dir():
+                    unpacked = f"  已解包 `work/{cand}`"
+                    break
+            mark = " ← 本题" if a["path"] in arts else ""
+            L.append(f"- `evi/{a['path']}` {human(a['size_bytes'])} [{kind}]{unpacked}{mark}")
+        L.append("")
+
+    others = c.db.execute(
+        "SELECT * FROM findings WHERE (qid IS NULL OR qid NOT IN (%s)) ORDER BY id DESC LIMIT 40"
+        % ",".join("?" * len(qids)),
+        qids,
+    ).fetchall()
+    if others:
+        L += ["## 其他检材的线索（跨题，可联想）", ""]
+        for f in reversed(others):
+            txt = " ".join((f["text"] or "").split())[:150]
+            L.append(f"- [{f['kind']}] {txt}  ({f['qid']})")
+        L.append("")
+
+    if dead:
+        L += ["## 死路（别再走）", ""] + [f"- {d['text']}" for d in dead] + [""]
+
+    rules = ["## 规矩", ""]
+    if batch:
+        rules += [
+            f"- 这 {len(rows)} 道题**都在这个会话里做完**。每答完一题立刻：",
+            "  `fcase answer \"<摘要>\" \"<答案>\" --q Qxx --evidence \"...\" --confidence 0.9`",
+            "- 标「承上题」的题共享前面的探索，别重跑一遍",
+            "- 一题实在做不出：`fcase deadend \"...\" --q Qxx` 然后跳过，别卡住整批",
+            "- 结束前自检：每道题都要有 `fcase answer --q`，缺一道这批就不算完成",
+        ]
+    else:
+        rules += [
+            f"- 只做这一题。做完必须 `fcase answer ... --q {first}`，否则不算完成。",
+            "- 每条事实立刻 `fcase note <kind> \"...\" --q " + first + " --locator ...`，别攒着。",
+        ]
+    rules += [
+        "- **先联想，再动手。** 密码 / 密钥 / 账号 / 文件名这类东西，答案往往在**别的检材**里"
+        "（聊天记录、便签、备注、文件名、照片）。先看上面的「全案检材」和「其他检材的线索」，"
+        "再到对应工作区 `rg`，比在单一镜像里硬砸快得多。",
+        "- **禁止暴力破解。** 不要起 hashcat/john/自写多进程爆破。密码一定是推理出来的；"
+        "实在找不到就 `fcase deadend` 记下来，交给人处理。",
+        "- **看图用 `vlook`，不要 OCR、不要传外网。** 遇到截图/照片/谜题图：",
+        "  `vlook <图片> \"要它抄什么\"`（默认用 llama-4-scout 视觉模型，可 `-m MiniCPM-V-4.7-1B` 换快的）。"
+        "禁止 `curl` 到 ocr.space / bing 之类的服务，也禁止自己写 OCR。",
+        "- **先看有没有现成脚本**：`scripts/` 下有 xor-decrypt / sqlite-dump / plist2json / "
+        "find-sqlite / hash-file，写新脚本前先看这些。",
+        "- **批量取文件用 `fcase extract`**，不要 while icat 循环（每个都重开镜像）。",
+        "- 可用工具只有十几个，`fcase tools` 列全；不要去找没装的。",
+        "- **并行发命令。** 互不依赖的查询要**在同一个回合里发多个 tool call**，"
+        "不要「想 → 跑一条 → 想 → 跑一条」。例：同时查 3 个注册表键、同时看 4 个文件的头 20 行、"
+        "同时查 3 个 sqlite 表。实测串行时 81% 的回合只发了 1 个调用，白白多绕一圈模型。",
+        "- **极值题先列候选再取极值。** 题目含「最后 / 最早 / 首次 / 唯一 / 哪一个」时："
+        "把所有候选列出来（至少 3 条，带判据字段）→ 排序 → 取极值，"
+        "evidence 里写「候选 N 个，前 3 名是 …，取第 1」。"
+        "拿到第一个像样的候选就交卷，是最常见的错法。",
+        "- **计数题先写判据。** 含「多少 / 几个 / 次数」时：先把过滤条件（字段=值）写出来，"
+        "再 count；判据有多种解释时，evidence 里写明选了哪种、为什么，并给出另一种口径的数。",
+        "- **原文题逐字符核对。** 题目写「依照原文 / 保留大小写」时，交卷前用 `repr()` 或 `hexdump` "
+        "核一遍大小写、空格、符号，不要顺手小写化或补格式。",
+        "- **机械取数派子 agent。** 需要大批量 dump / 遍历 / 提取字段时，别在主会话里做，"
+        "派 `collector` 子 agent（它跑在便宜的模型上，只回一行摘要 + 落盘 JSON），"
+        "主会话只读 JSON 做判断。这样贵的模型只花在判断上。",
+        "- **运行时状态优先于配置。** 题目含「监听 / 运行中 / 当前 / 实际」时，读运行时快照"
+        "（`ss -tlnp` / netstat / 进程表 / 实时保全记录），配置文件里的 PORT 只能当交叉参考；"
+        "两者不一致以运行时为准，并在 evidence 里写明两个值。",
+        "- **时间题写全。** evidence 里同时给「原始值 + 时区」和「换算后值」，"
+        "例：`原始 11:34:56 UTC；题干要 UTC+8 → 19:34:56`。",
+        "- 命令输出会自动截断到 8KB 并落盘；要看全文用 `read` 打开提示的路径。",
+        "- 装任何东西前先 `fcase need <pkg> --reason \"...\"` 然后停下，等人工处理。",
+        "- 走不通的路写 `fcase deadend \"...\"`，别让下一个会话重走。", "",
+    ]
+    L += rules
+    dest.write_text("\n".join(L) + "\n", encoding="utf-8")
+    print(f"已生成 {dest.relative_to(c.root)}（{dest.stat().st_size} 字节，{len(rows)} 题）")
+
+
+def render(c: Case) -> None:
+    arts = c.db.execute("SELECT * FROM artifacts ORDER BY path").fetchall()
+    finds = c.db.execute("SELECT * FROM findings ORDER BY id").fetchall()
+
+    inv = ["# 检材清单", "", f"自动生成于 {now()}，不要手改。", "",
+           "| 路径 | 大小 | sha256 |", "|---|---|---|"]
+    for r in arts:
+        inv.append(f"| `{r['path']}` | {human(r['size_bytes'])} | `{r['sha256'] or '-'}` |")
+    (c.meta / "inventory.md").write_text("\n".join(inv) + "\n", encoding="utf-8")
+
+    f = ["# 线索", "", f"自动生成于 {now()}，不要手改。想写人话请写 `notes.md`。", ""]
+    if not finds:
+        f.append("_还没有线索。_")
+    for r in finds:
+        f.append(f"## #{r['id']} [{r['kind']}] {r['created_at']}")
+        f.append("")
+        f.append(r["text"])
+        if r["locator"]:
+            f.append(f"\n- 位置：`{r['locator']}`")
+        if r["src"]:
+            f.append(f"- 来源：`{r['src']}`")
+        f.append("")
+    (c.meta / "findings.md").write_text("\n".join(f) + "\n", encoding="utf-8")
+
+    render_answers(c)
+    render_board(c)
+
+
+def render_answers(c: Case) -> None:
+    """交卷格式：按题号排，题干用卷子原文，一题一条（同题多答取最新）。"""
+    qs = c.db.execute("SELECT * FROM questions ORDER BY n").fetchall()
+    latest: dict[str, sqlite3.Row] = {}
+    loose = []
+    for r in c.db.execute("SELECT * FROM answers ORDER BY id"):
+        if r["qid"]:
+            latest[r["qid"]] = r          # 后来的覆盖先前的
+        else:
+            loose.append(r)
+
+    out = ["# 答案", "", f"自动生成于 {now()}，不要手改。按题号排，一题一条。", ""]
+
+    if qs:
+        done = sum(1 for q in qs if q["id"] in latest)
+        pts = sum(q["points"] for q in qs if q["id"] in latest)
+        total_pts = sum(q["points"] for q in qs)
+        out += [f"进度 **{done}/{len(qs)}** 题，**{pts}/{total_pts}** 分", "", "## 速查", "",
+                "| 题号 | 答案 |", "|---|---|"]
+        for q in qs:
+            a = latest.get(q["id"])
+            if a is None:
+                continue
+            cell = " ".join(a["answer"].split())[:60].replace("|", "\\|")
+            out.append(f"| {q['id']} | {cell} |")
+        out.append("")
+        grp = None
+        for q in qs:
+            a = latest.get(q["id"])
+            if q["grp"] != grp:
+                grp = q["grp"]
+                out += [f"## {grp}", ""]
+            stem = " ".join(q["stem"].split())
+            if len(stem) > 120:
+                stem = stem[:120] + "…"
+            out += [f"### {q['id']}（{TYPE_CN.get(q['type'], q['type'])}，{q['points']} 分）", ""]
+            out += [f"> {stem}", ""]
+            if a is None:
+                out += ["**答案**：*未作答*" if q["status"] != "blocked" else "**答案**：*已放弃（见 findings.md）*", ""]
+                continue
+            out += [f"**答案**：{a['answer']}", ""]
+            conf = f"{a['confidence']:.2f}" if a["confidence"] is not None else "未给"
+            out.append(f"- 置信度：{conf}")
+            if a["evidence"]:
+                out.append(f"- 证据：{a['evidence']}")
+            out.append(f"- 记录时间：{a['created_at']}")
+            out.append("")
+    else:
+        out.append("_没有导入题目（`fcase import meta/question.md`）。_")
+        out.append("")
+
+    if loose:
+        out += ["## 未归到题号的答案（早期自由记录）", ""]
+        for r in loose:
+            out += [f"- #{r['id']} {r['question']} → **{r['answer']}**"]
+        out.append("")
+
+    (c.meta / "answers.md").write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def render_board(c: Case) -> None:
+    qs = c.db.execute("SELECT * FROM questions ORDER BY n").fetchall()
+    if not qs:
+        return
+    ans = _answers_by_qid(c)
+    L = ["# 题目看板", "", f"自动生成于 {now()}，不要手改。", ""]
+    grp = None
+    for r in qs:
+        if r["grp"] != grp:
+            grp = r["grp"]
+            L += ["", f"## {grp}（`{r['artifact'] or '-'}`）", "",
+                  "| 题号 | 题型 | 状态 | 题干 | 答案 |", "|---|---|---|---|---|"]
+        a1 = ans.get(r["id"])
+        stem = r["stem"].replace("\n", " ")[:50].replace("|", "\\|")
+        ansv = (a1["answer"][:30].replace("|", "\\|") if a1 else "")
+        L.append(f"| {r['id']} | {TYPE_CN.get(r['type'], r['type'])} | {r['status']} | {stem} | {ansv} |")
+    done = sum(1 for r in qs if r["status"] == "done")
+    L += ["", f"进度 **{done}/{len(qs)}**", ""]
+    (c.meta / "board.md").write_text("\n".join(L) + "\n", encoding="utf-8")
+
+
+def cmd_render(c: Case, a: argparse.Namespace) -> None:
+    render(c)
+    print(f"已重写 {c.meta}/inventory.md findings.md answers.md" + (" board.md" if (c.meta / "board.md").exists() else ""))
+
+
+# ---------------------------------------------------------------- main
+
+
+
+# ================================================================
+# v4：分类（plan）/ 产物目录 / agent 视图
+# ================================================================
+
+ART_KIND = {".e01": "磁盘镜像", ".ex01": "磁盘镜像", ".bin": "磁盘镜像",
+            ".dd": "磁盘镜像", ".img": "磁盘镜像", ".vhd": "磁盘镜像",
+            ".zip": "压缩包", ".7z": "压缩包", ".rar": "压缩包",
+            ".pcap": "抓包", ".pcapng": "抓包"}
+
+
+def art_kind(c: Case, name: str) -> str:
+    """检材类型：优先读索引 json 的 kind，否则看扩展名。"""
+    idx = c.meta / "index" / f"{idx_name(name)}.json"
+    if idx.is_file():
+        try:
+            k = json.loads(idx.read_text(encoding="utf-8")).get("kind")
+            if k:
+                return str(k)
+        except (OSError, ValueError):
+            pass
+    return ART_KIND.get(Path(name).suffix.lower(), "未知")
+
+
+def art_dir(c: Case, artifact: str) -> Path:
+    """检材的产物目录 artifacts/<idx_name>/，按需创建。
+
+    用 idx_name（完整相对路径归一化）而不是 Path.stem ——
+    这套题里 方俊郎/phone.E01 和 黄志远/phone.E01 同名，用 stem 会把清单和日志混在一起。
+    """
+    d = c.arts / idx_name(artifact)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def group_dir(c: Case, artifact: str, gid: str) -> Path:
+    """题组产物目录 artifacts/<stem>/<gid>/。"""
+    d = art_dir(c, artifact) / gid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _qids(rows) -> list[str]:
+    return [r["id"] for r in rows]
+
+
+def _shared_tokens(rows, own_artifact: str) -> set[str]:
+    """题干里出现的「文件名类」关键词，用于跨组关联（排除自己绑定的检材）。"""
+    import re as _re
+    toks: set[str] = set()
+    for r in rows:
+        for m in _re.findall(r"[A-Za-z0-9_.\-]{4,}\.(?:zip|7z|rar|E01|e01|bin|pcap|txt|jpg|png|db|sqlite)", r["stem"] or ""):
+            if m != own_artifact:
+                toks.add(m.lower())
+        for m in _re.findall(r"`([A-Za-z0-9_.\-]{4,})`", r["stem"] or ""):
+            if m.lower() != Path(own_artifact).stem.lower() and "." in m:
+                toks.add(m.lower())
+    return toks
+
+
+
+def cmd_stage(c: Case, a: argparse.Namespace) -> None:
+    """把检材复制到原生盘（~/scratch/<case>/），避免 9p 随机读把 fls 拖死。
+
+    实测：同一份 E01 在 /mnt/d 上 `fls -r` 180 秒跑不完，原生盘 16 秒。
+    """
+    import shutil
+    rows = c.db.execute("SELECT * FROM artifacts ORDER BY size_bytes DESC").fetchall()
+    if not rows:
+        die("还没有登记检材。先 fcase ls")
+    dest_root = Path.home() / "scratch" / c.root.name / "evi"
+    dest_root.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(dest_root).free
+    need = sum(r["size_bytes"] for r in rows)
+    if need > free:
+        die(f"原生盘空间不够：需要 {human(need)}，可用 {human(free)}")
+
+    limit = None if getattr(a, "all", False) else int(getattr(a, "max_size", 4) * 1024 ** 3)
+    mapping = {}
+    for r in rows:
+        src = c.evi / r["path"]
+        dst = dest_root / r["path"]
+        if not src.is_file():
+            print(f"  跳过（不存在）：{r['path']}")
+            continue
+        if limit is not None and r["size_bytes"] > limit:
+            print(f"  跳过（{human(r['size_bytes'])} > {human(limit)}，用 --all 强制）：{r['path']}")
+            continue
+        if dst.is_file() and dst.stat().st_size == src.stat().st_size:
+            print(f"  已有：{r['path']}  {human(r['size_bytes'])}")
+        else:
+            # 先写 .part 再改名：中途被杀不会留下"看起来完整"的半个文件
+            part = dst.with_suffix(dst.suffix + ".part")
+            print(f"  复制：{r['path']}  {human(r['size_bytes'])} …", end="", flush=True)
+            try:
+                shutil.copy2(src, part)
+                os.replace(part, dst)
+            except OSError as exc:
+                print(f" 失败：{exc}")
+                continue
+            print(" 完成")
+        mapping[r["path"]] = str(dst)
+
+    (c.meta / "stage.json").write_text(json.dumps(mapping, ensure_ascii=False, indent=1),
+                                       encoding="utf-8")
+    print(f"\n共 {len(mapping)} 个检材 -> {dest_root}")
+    print("简报里会自动带上这些路径；工具请读原生盘副本。")
+
+
+def cmd_index_deep(c: Case, a: argparse.Namespace) -> None:
+    """对磁盘检材跑一次完整 fls，清单存到 artifacts/<stem>/ 供全组复用。"""
+    import subprocess
+    stem = a.stem
+    # 先按完整路径/idx_name 精确匹配（phone.E01 有多个，LIKE 会撞车），再退回 LIKE
+    row = c.db.execute("SELECT * FROM artifacts WHERE path=?", (stem,)).fetchone()
+    if not row:
+        for cand in c.db.execute("SELECT * FROM artifacts"):
+            if idx_name(cand["path"]) == stem:
+                row = cand
+                break
+    if not row:
+        hits = [r for r in c.db.execute("SELECT * FROM artifacts") if stem in r["path"]]
+        if len(hits) == 1:
+            row = hits[0]
+        elif len(hits) > 1:
+            die(f"'{stem}' 匹配到 {len(hits)} 个检材，请写完整路径："
+                + ", ".join(h["path"] for h in hits))
+    if not row:
+        die(f"没有检材: {stem}")
+    art = row["path"]
+    d = art_dir(c, art)
+    idx = c.meta / "index" / f"{idx_name(art)}.json"
+    parts = []
+    if idx.is_file():
+        try:
+            parts = json.loads(idx.read_text(encoding="utf-8")).get("partitions") or []
+        except ValueError:
+            parts = []
+    if not parts:
+        # 有些检材解包后是「文件系统目录」（Android data/、iOS var/），不是镜像。
+        # 这种直接遍历目录生成清单，别去跑 fls。
+        unp = unpacked_dir(c, art)
+        if unp is not None and not find_image(c, art):
+            out = d / "dirwalk.txt"
+            print(f"  解包后是目录，遍历生成清单 …", end="", flush=True)
+            t0 = time.time()
+            n = 0
+            with out.open("w", encoding="utf-8") as fh:
+                for p_ in unp.rglob("*"):
+                    try:
+                        if p_.is_file():
+                            fh.write(f"r/r {p_}:\t{p_}\t{p_.stat().st_size}\n")
+                            n += 1
+                    except OSError:
+                        continue
+            print(f" {n} 行 / {time.time() - t0:.0f}s → {out.name}")
+            derive_index(d, art, c)
+            return
+        die(f"{art} 不是磁盘镜像，或者还没生成索引（fcase index {Path(art).stem}）")
+
+    # 镜像位置：解包出来的 > stage 副本 > evi 原件
+    img = find_image(c, art)
+    staged = None
+    sf = c.meta / "stage.json"
+    if sf.is_file():
+        try:
+            staged = json.loads(sf.read_text(encoding="utf-8")).get(art)
+        except ValueError:
+            staged = None
+    src = str(img) if img else (staged or str(c.evi / art))
+
+    made = 0
+    for p_ in parts:
+        start, desc = p_.get("start"), p_.get("desc", "")
+        # start=0 是合法值（单卷镜像），不能用 not start 判断
+        if start is None or "Unallocated" in desc or "Primary Table" in desc:
+            continue
+        out = d / f"fls-{start}.txt"
+        if out.is_file() and out.stat().st_size > 0:
+            print(f"  已有：{out.name}")
+            continue
+        print(f"  fls -o {start} -> {out.name} …", end="", flush=True)
+        with out.open("w", encoding="utf-8") as fh:
+            subprocess.run(["fls", "-o", str(start), "-r", "-p", src],
+                           stdout=fh, stderr=subprocess.DEVNULL, timeout=1800)
+        n = sum(1 for _ in out.open(encoding="utf-8", errors="replace"))
+        print(f" {n} 行")
+        made += 1
+
+    # 分区读不出文件系统时（pve 用 LVM），改用 dissect 一次性走完所有目录。
+    # sleuthkit 不支持 LVM；而 target-fs 每次调用都重开镜像，所以用一个进程遍历。
+    total_lines = sum(1 for f in d.glob("fls-*.txt")
+                      for _ in f.open(encoding="utf-8", errors="replace"))
+    if total_lines < 50:
+        walker = Path(__file__).resolve().parent / "internal" / "dissect-walk.py"
+        py = Path.home() / "projects/forensics/tools/venv-win/bin/python3"
+        img_path = Path(img) if img else (c.evi / art)
+        if walker.is_file() and py.is_file():
+            out = d / "target-walk.txt"
+            print(f"  fls 读不出内容（LVM?），用 dissect 遍历 …", end="", flush=True)
+            t0 = time.time()
+            r = subprocess.run([str(py), str(walker), str(img_path), str(out)],
+                               capture_output=True, timeout=3600)
+            k = sum(1 for _ in out.open(encoding="utf-8", errors="replace")) if out.is_file() else 0
+            print(f" {k} 行 / {time.time() - t0:.0f}s → {out.name}")
+            (d / "READ-HINT.txt").write_text(
+                "**这个检材用 LVM，sleuthkit(fls/icat) 读不了分区。**\n\n"
+                f"已生成完整文件清单：`{out.relative_to(c.root)}`（{k} 行）—— 直接 rg 它。\n\n"
+                "要读具体文件内容，用 dissect：\n"
+                "```bash\n"
+                f"TF=~/projects/forensics/tools/bin/target-fs\n"
+                f"$TF {img_path} cat /etc/pve/storage.cfg\n"
+                f"$TF {img_path} ls  /etc/pve\n"
+                "```\n",
+                encoding="utf-8")
+
+    derive_index(d, art, c)
+    print(f"\n{made} 份清单写入 {d.relative_to(c.root)}/，组内所有题直接 rg 这些文件，不要重跑 fls。")
+
+
+# 派生索引用的关键词表（路径里出现即收录）
+DERIVE_RULES = {
+    "hives.txt": [
+        r"(?:^|[\s/])config/(SAM|SYSTEM|SOFTWARE|SECURITY|DEFAULT)$",
+        r"(?:^|[\s/])Users/[^/]+/NTUSER\.DAT$",
+        r"(?:^|[\s/])Users/[^/]+/AppData/Local/Microsoft/Windows/UsrClass\.dat$",
+        r"\.evtx$", r"\.hiv$", r"\.reg$",
+    ],
+    "ci-files.txt": [
+        r"(?i)\b(password|passwd|pwd|credential|secret|token|api[_-]?key|wallet|seed|mnemonic|kdbx|keychain)\.(txt|json|ini|cfg|conf|env|dat|db|kdbx)$",
+        r"(?i)(?:^|[\s/])\.env$", r"(?i)\bconfig(\.|$)",
+        r"(?i)\b(teamviewer|anydesk|telegram|wechat|whatsapp|signal)\b",
+    ],
+    "databases.txt": [
+        r"(?i)\.(db|sqlite|sqlite3|db3|realm|plist|ldb)$",
+        r"(?i)\b(History|Cookies|Login Data|Web Data|Preferences)$",
+    ],
+    "media.txt": [
+        r"(?i)\.(jpg|jpeg|png|gif|heic|mp4|mov|avi|mkv|wav|mp3|pdf|docx?|xlsx?)$",
+    ],
+}
+
+
+def derive_index(d: Path, art: str, c: Case) -> None:
+    """从 fls-*.txt 派生若干"一眼能看到重点"的清单。
+
+    为什么要这么做：实测 16% 的命令是 ls/head/cat/find 这类纯探索。
+    预先按关键词把路径分好类，agent 直接读清单，不用自己摸。
+    """
+    import re as _re
+    listings = sorted(d.glob("fls-*.txt"))
+    if not listings:
+        return
+    lines: list[str] = []
+    for f in listings:
+        try:
+            with f.open(encoding="utf-8", errors="replace") as fh:
+                lines.extend(l.rstrip("\n") for l in fh)
+        except OSError:
+            continue
+    if not lines:
+        return
+
+    print(f"  派生索引：读取 {len(lines):,} 行清单 …", end="", flush=True)
+    for name, pats in DERIVE_RULES.items():
+        rx = [_re.compile(p) for p in pats]
+        hit = [l for l in lines if any(r.search(l) for r in rx)]
+        out = d / name
+        out.write_text("\n".join(hit) + ("\n" if hit else ""), encoding="utf-8")
+        print(f" {name}={len(hit)}", end="", flush=True)
+
+    # 车机检材：有 CAN 日志就写一份读法提示，并把 venv-auto 的路径写上
+    can_logs = [l for l in lines if re.search(r"(?i)\.(asc|blf|mdf|dbc)$", l)]
+    if can_logs:
+        (d / "READ-HINT-can.txt").write_text(
+            "# 这个检材里有 CAN 总线日志\n\n"
+            f"共 {len(can_logs)} 个 CAN 相关文件（.asc/.blf/.mdf/.dbc）。\n\n"
+            "## ASC 是纯文本，直接读就行\n"
+            "```\n"
+            "0.002665 1  050  Rx  d 8 3E 24 62 0B D0 94 DC 5F\n"
+            "  ↑时间戳  ↑通道 ↑ID  ↑方向 ↑DLC ↑8 字节数据\n"
+            "```\n"
+            "**先用统计脚本，不要直接 head 几万行**：\n"
+            "```bash\n"
+            "python3 ~/projects/forensics/scripts/can-asc-summary.py <file.asc>            # 全量统计\n"
+            "python3 ~/projects/forensics/scripts/can-asc-summary.py <file.asc> --id 3B4   # 只看某个 ID\n"
+            "python3 ~/projects/forensics/scripts/can-asc-summary.py <file.asc> --id 3B4 --first-byte\n"
+            "```\n"
+            "脚本会给出：每个 ID 的条数/周期/抖动/速率、周期性可疑的 ID、\n"
+            "速率突然翻倍的窗口、某 ID 的首字节变化时刻。\n\n"
+            "## 需要解码 DBC / 转格式时\n"
+            "```bash\n"
+            "asc2log -I <in.asc> -O <out.log>              # ASC → candump 格式\n"
+            "cantools dump <xxx.dbc> <frame_hex>           # 按 DBC 解码一帧\n"
+            "~/projects/forensics/tools/venv-auto/bin/python3 -c \"import can,cantools,asammdf; print('ok')\"\n"
+            "```\n"
+            "venv-auto 里有 python-can / cantools / udsoncan / asammdf，\n"
+            "需要写解析脚本时用这个解释器，不要用系统 python3。\n\n"
+            "## 其它常见位置\n"
+            "- `edr/events/*.bin`     碰撞事件采样（二进制，自己按 struct 解）\n"
+            "- `obd/history/*.log|*.bin`  OBD DTC 与冻结帧\n"
+            "- `system/lib/firmware/ecu/*.bin`  ECU 固件（找密钥/标志用 strings + xxd）\n"
+            "- `security/pke/rf_logs.txt`  PKE/NFC 刷卡记录\n"
+            "- `tbox/comm/*.bin`, `tbox/ota/update.log`  T-BOX 通信与升级日志\n"
+            "- `system/var/log/kern.log`   内核日志\n",
+            encoding="utf-8")
+
+    # 目录速览：两层聚合，给 agent 一个"先看哪里"的抓手，省掉探索
+    import collections as _c
+    dirs: dict[str, list[int]] = {}
+    for l in lines:
+        parts = l.split("\t")
+        if len(parts) < 2:
+            continue
+        path = parts[1].strip()
+        if not path or path.startswith("/"):
+            path = path.lstrip("/")
+        seg = path.split("/")
+        key = "/".join(seg[:2]) if len(seg) > 2 else "/".join(seg[:-1]) or "."
+        try:
+            size = int(parts[2]) if len(parts) > 2 and parts[2].strip().isdigit() else 0
+        except (ValueError, IndexError):
+            size = 0
+        d0 = dirs.setdefault(key, [0, 0])
+        d0[0] += 1
+        d0[1] += size
+    # fls 清单没有文件大小（只有 dissect-walk 有），此时按文件数排序
+    has_size = any(v[1] > 0 for v in dirs.values())
+    top = sorted(dirs.items(), key=lambda kv: -(kv[1][1] if has_size else kv[1][0]))[:40]
+    (d / "top-dirs.txt").write_text(
+        "\n".join((f"{k}\t{n} 文件\t{sz/1048576:.1f} MB" if has_size else f"{k}\t{n} 文件")
+                  for k, (n, sz) in top) + "\n",
+        encoding="utf-8")
+
+    # 扩展名分布，判断这台机器上什么最多
+    from collections import Counter
+    ext = Counter()
+    for l in lines:
+        m = _re.search(r"\.([A-Za-z0-9]{1,6})$", l.strip())
+        if m:
+            ext[m.group(1).lower()] += 1
+    top = "\n".join(f"{e}\t{n}" for e, n in ext.most_common(40))
+    (d / "ext-count.txt").write_text(top + "\n", encoding="utf-8")
+    print(" ext-count.txt")
+
+
+
+def _plan_input(c: Case) -> str:
+    """给分类 agent 看的输入清单。"""
+    qs = c.db.execute("SELECT * FROM questions ORDER BY n").fetchall()
+    arts = c.db.execute("SELECT * FROM artifacts ORDER BY path").fetchall()
+    L = ["# 题目与检材清单", "", f"共 {len(qs)} 题 / {len(arts)} 个检材。", "",
+         "## 检材", "", "| 文件 | 大小 | 类型 | 题数 |", "|---|---|---|---|"]
+    per = {}
+    for q in qs:
+        per[q["artifact"]] = per.get(q["artifact"], 0) + 1
+    for a in arts:
+        L.append(f"| `{a['path']}` | {human(a['size_bytes'])} | {art_kind(c, a['path'])} | "
+                 f"{per.get(a['path'], 0)} |")
+    L += ["", "## 题目", ""]
+    cur = None
+    for q in qs:
+        if q["artifact"] != cur:
+            cur = q["artifact"]
+            L += ["", f"### {cur or '（未绑定检材）'}", ""]
+        stem = " ".join((q["stem"] or "").split())
+        L.append(f"- **{q['id']}** [{TYPE_CN.get(q['type'], q['type'])}, {q['points']}分] {stem[:160]}")
+    return "\n".join(L) + "\n"
+
+
+def cmd_plan(c: Case, a: argparse.Namespace) -> None:
+    """分类：默认生成输入清单+模板交给主 agent；--apply 校验入库；--auto 用启发式兜底。"""
+    qs = c.db.execute("SELECT * FROM questions ORDER BY n").fetchall()
+    if not qs:
+        die("没有题目。先 fcase import meta/question.md")
+
+    if not getattr(a, "apply", False) and not getattr(a, "auto", False):
+        (c.meta / "plan-in.md").write_text(_plan_input(c), encoding="utf-8")
+        tpl = [{"id": "G1", "name": "示例组名", "artifact": qs[0]["artifact"] or "",
+                "qids": [qs[0]["id"]], "depends": [], "est_min": 30,
+                "reason": "为什么这么分"}]
+        (c.meta / "map.json").write_text(json.dumps(tpl, ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+        prompt = c.root.parent.parent  # 占位，避免未使用告警
+        del prompt
+        print("已生成：")
+        print(f"  {c.meta / 'plan-in.md'}    ← 给分类 agent 看的题目/检材清单")
+        print(f"  {c.meta / 'map.json'}      ← 输出模板（已填示例，需覆盖）")
+        print()
+        print("下一步（交给主 agent）：")
+        print("  1. 读 prompts/plan.md 的分类规则")
+        print("  2. 读 meta/plan-in.md")
+        print("  3. 写出 meta/map.json（覆盖示例）")
+        print("  4. fcase plan --apply   校验并入库")
+        print()
+        print("不想用 agent、只想先粗分：fcase plan --auto")
+        return
+
+    # ---- --auto：不用 agent，按检材 + 固定大小粗略切分 ----
+    if getattr(a, "auto", False):
+        recs = []
+        cur_art, bucket, n = None, [], 0
+        for q in qs:
+            if q["artifact"] != cur_art and bucket:
+                recs.append(bucket); bucket = []
+            cur_art = q["artifact"]
+            bucket.append(q)
+            if len(bucket) >= 8:
+                recs.append(bucket); bucket = []
+        if bucket:
+            recs.append(bucket)
+        out = []
+        for i, rows in enumerate(recs, 1):
+            first_art = rows[0]["artifact"]
+            if not first_art:
+                any_a = c.db.execute("SELECT path FROM artifacts ORDER BY size_bytes DESC LIMIT 1").fetchone()
+                first_art = any_a["path"] if any_a else ""
+            out.append({"id": f"G{i}", "name": f"{rows[0]['id']}–{rows[-1]['id']} 连续题",
+                        "artifact": first_art,
+                        "qids": [r["id"] for r in rows], "depends": [],
+                        "est_min": len(rows) * 8,
+                        "reason": "自动粗分（按检材+连续 8 题），建议让 agent 重新分类"})
+        (c.meta / "map.json").write_text(json.dumps(out, ensure_ascii=False, indent=1),
+                                         encoding="utf-8")
+        print(f"已生成粗分 map.json（{len(out)} 组），继续入库…\n")
+
+    # ---- 读 map.json 并校验 ----
+    mf = c.meta / "map.json"
+    if not mf.is_file():
+        die(f"缺少 {mf}；先 fcase plan 生成模板")
+    try:
+        recs = json.loads(mf.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        die(f"map.json 不是合法 JSON: {exc}")
+    if not isinstance(recs, list) or not recs:
+        die("map.json 必须是数组")
+
+    all_ids = [q["id"] for q in qs]
+    art_names = {r["path"] for r in c.db.execute("SELECT path FROM artifacts")}
+    seen: list[str] = []
+    errs: list[str] = []
+    ids = set()
+    for i, r in enumerate(recs, 1):
+        gid = r.get("id") or f"G{i}"
+        if gid in ids:
+            errs.append(f"{gid}: id 重复")
+        ids.add(gid)
+        if not r.get("name"):
+            errs.append(f"{gid}: 缺 name")
+        if r.get("artifact") not in art_names:
+            errs.append(f"{gid}: artifact '{r.get('artifact')}' 不在 evi/ 清单里")
+        qids = r.get("qids") or []
+        if not qids:
+            errs.append(f"{gid}: qids 为空")
+        for q in qids:
+            if q not in all_ids:
+                errs.append(f"{gid}: 题号 {q} 不存在")
+        seen.extend(qids)
+    dup = {q for q in seen if seen.count(q) > 1}
+    if dup:
+        errs.append(f"题号重复出现: {', '.join(sorted(dup))}")
+    missing = set(all_ids) - set(seen)
+    if missing:
+        errs.append(f"漏了 {len(missing)} 题: {', '.join(sorted(missing)[:10])}")
+    for r in recs:
+        for d in (r.get("depends") or []):
+            if d not in ids:
+                errs.append(f"{r.get('id')}: depends 指向不存在的组 {d}")
+    # 组太粗会拖慢墙钟（墙钟受最长单组限制），超过 5 题给个提醒
+    big = [(r.get("id"), len(r.get("qids") or [])) for r in recs if len(r.get("qids") or []) > 5]
+    if big:
+        print("提醒：以下组超过 5 题，会拖慢并行墙钟（目标 2–4 题/组）：", file=sys.stderr)
+        for gid, n in big:
+            print(f"  - {gid}: {n} 题", file=sys.stderr)
+        print("", file=sys.stderr)
+
+    if errs:
+        print("map.json 校验失败：", file=sys.stderr)
+        for e in errs:
+            print(f"  - {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    # ---- 入库 ----
+    c.db.execute("DELETE FROM groups")
+    for r in recs:
+        c.db.execute(
+            "INSERT INTO groups (id,name,artifact,qids,depends,est_min,status) VALUES (?,?,?,?,?,?,?)",
+            (r["id"], r["name"], r["artifact"], ",".join(r["qids"]),
+             ",".join(r.get("depends") or []), int(r.get("est_min") or 30), "todo"))
+    c.db.commit()
+
+    # ---- 渲染 map.md ----
+    by_art: dict[str, list] = {}
+    for r in recs:
+        by_art.setdefault(r["artifact"], []).append(r)
+    L = ["# 检材与题组分类", "",
+         f"由主 agent 生成、`fcase plan --apply` 校验入库于 {now()}。",
+         f"共 {len(qs)} 题 / {len(recs)} 组 / {len(by_art)} 个检材。", ""]
+    for art, rs in by_art.items():
+        a_info = c.db.execute("SELECT * FROM artifacts WHERE path=?", (art,)).fetchone()
+        L += [f"## {Path(art).stem}  `{art}`  "
+              f"{human(a_info['size_bytes']) if a_info else '?'}  {art_kind(c, art)}",
+              f"共 {sum(len(r['qids']) for r in rs)} 题 / {len(rs)} 组", ""]
+        for r in rs:
+            dep = f"　依赖 {', '.join(r['depends'])}" if r.get("depends") else ""
+            L.append(f"- **{r['id']}** {r['name']}  `{r['qids'][0]}–{r['qids'][-1]}`"
+                     f"（{len(r['qids'])} 题，约 {r['est_min']} 分钟）{dep}")
+            if r.get("reason"):
+                L.append(f"  - {r['reason']}")
+        L.append("")
+    L += ["## 怎么用", "",
+          "- `fcase board` 看进度，`fcase agents` 看谁在跑",
+          "- 每组一个 worker，产物落 `artifacts/<检材>/<组号>/`", ""]
+    (c.meta / "map.md").write_text("\n".join(L) + "\n", encoding="utf-8")
+
+    # ---- 每检材 INDEX.md + 组目录 ----
+    for art, rs in by_art.items():
+        d = art_dir(c, art)
+        for r in rs:
+            group_dir(c, art, r["id"])
+        idx = [f"# {art}", "",
+               f"- 类型：{art_kind(c, art)}",
+               f"- 题组：{len(rs)} 组 / {sum(len(r['qids']) for r in rs)} 题", "",
+               "## 题组与产物", ""]
+        for r in rs:
+            idx.append(f"- `{r['id']}` {r['name']}（{r['qids'][0]}–{r['qids'][-1]}）→ `{r['id']}/`")
+        idx += ["", "> 中间产物放对应 `Gx/` 目录，不要散落到 work/。", ""]
+        (d / "INDEX.md").write_text("\n".join(idx) + "\n", encoding="utf-8")
+
+    print(f"已入库 {len(recs)} 个题组，覆盖 {len(seen)} 题；生成 meta/map.md 与 artifacts/*/INDEX.md")
+    for r in recs:
+        print(f"  {r['id']:4} {r['artifact'][:24]:24} {r['qids'][0]}–{r['qids'][-1]:4} "
+              f"{len(r['qids']):2}题  {r['name']}")
+
+
+def _latest_answer(c: Case, qid: str):
+    return c.db.execute(
+        "SELECT * FROM answers WHERE qid=? ORDER BY id DESC LIMIT 1", (qid,)).fetchone()
+
+
+def _seen_file(c: Case) -> Path:
+    return c.meta / ".answers_seen"
+
+
+def cmd_answers(c: Case, a: argparse.Namespace) -> None:
+    """答案表。--new 只显示上次看过之后新增的（并推进基线）。"""
+    if getattr(a, "new", False):
+        sf = _seen_file(c)
+        cur_max = c.db.execute("SELECT COALESCE(MAX(id),0) FROM answers").fetchone()[0]
+        if not sf.is_file():
+            sf.write_text(str(cur_max), encoding="utf-8")
+            print(f"已建立基线（当前 {cur_max} 条答案）。从现在起 --new 只显示新增的。")
+            return
+        seen = int(sf.read_text(encoding="utf-8").strip() or 0)
+        rows = c.db.execute(
+            "SELECT * FROM answers WHERE id>? ORDER BY id", (seen,)).fetchall()
+        if not rows:
+            print(f"没有新答案（基线 {seen}，当前 {cur_max}）")
+            return
+        latest: dict[str, dict] = {}
+        for r in rows:
+            if r["qid"]:
+                latest[r["qid"]] = dict(r)
+        print(f"新增 {len(latest)} 题（答案记录 {len(rows)} 条）\n")
+        print(f"{'题号':6} {'答案':52} 置信")
+        print("-" * 72)
+        for qid in sorted(latest):
+            r = latest[qid]
+            txt = (r["answer"] or "").replace("\n", " ")[:50]
+            conf = f"{r['confidence']:.2f}" if r["confidence"] is not None else "  - "
+            print(f"{qid:6} {txt:52} {conf}")
+        print("-" * 72)
+        print(f"{' '.join(sorted(latest))}")
+        sf.write_text(str(cur_max), encoding="utf-8")
+        return
+
+    rows = c.db.execute("SELECT * FROM questions ORDER BY n").fetchall()
+    if not rows:
+        die("没有题目")
+    done = 0
+    print(f"{'题号':6} {'状态':8} {'答案':52} 置信")
+    print("-" * 78)
+    for q in rows:
+        ans = _latest_answer(c, q["id"])
+        if ans:
+            done += 1
+        text = (ans["answer"] if ans else "").replace("\n", " ")[:50]
+        conf = f"{ans['confidence']:.2f}" if ans and ans["confidence"] is not None else "  - "
+        mark = "✓" if ans else ("!" if q["status"] == "blocked" else "·")
+        print(f"{mark}{q['id']:5} {q['status']:8} {text:52} {conf}")
+    print("-" * 78)
+    print(f"{done}/{len(rows)} 有答案")
+    sf = _seen_file(c)
+    if not sf.is_file():
+        sf.write_text(str(c.db.execute("SELECT COALESCE(MAX(id),0) FROM answers").fetchone()[0]),
+                      encoding="utf-8")
+
+
+def cmd_agents(c: Case, a: argparse.Namespace) -> None:
+    """所有 agent 一览（DB 记录 + 进程实况）。"""
+    rows = c.db.execute("SELECT * FROM agents ORDER BY id").fetchall()
+    if not rows:
+        print("还没有 agent。启动并发做题：fcase go --jobs 4")
+        return
+    print(f"{'ID':4} {'状态':9} {'组':6} {'模型':12} {'当前题':7} {'本题已跑':9} {'上次命令':9} 进程")
+    print("-" * 82)
+    for r in rows:
+        alive = "运行中" if r["status"] == "running" else "—"
+        idle = cmdlog_age(c, r["id"])
+        print(f"{r['id']:4} {r['status']:9} {str(r['grp'])[:6]:6} {str(r['model'])[:12]:12} "
+              f"{str(r['current_qid'])[:7]:7} {age_str(q_age(r['q_started'])):9} "
+              f"{age_str(idle) + ' 前':9} {alive}")
+    stuck = [r["id"] for r in rows if r["status"] == "running"
+             and (cmdlog_age(c, r["id"]) or 0) > 600]
+    if stuck:
+        print(f"\n⚠ {', '.join(stuck)} 超过 10 分钟没有新命令，可能卡住；看 meta/blocked.md 或 artifacts/*/logs/")
+
+
+def cmd_why(c: Case, a: argparse.Namespace) -> None:
+    """题解：这道题怎么查的、走过哪些死路、换过几个模型。"""
+    q = c.db.execute("SELECT * FROM questions WHERE id=?", (a.qid,)).fetchone()
+    if not q:
+        die(f"没有这道题: {a.qid}")
+    finds = c.db.execute("SELECT * FROM findings WHERE qid=? ORDER BY id", (a.qid,)).fetchall()
+    deads = c.db.execute("SELECT * FROM deadends WHERE qid=? ORDER BY id", (a.qid,)).fetchall()
+    atts = c.db.execute("SELECT * FROM attempts WHERE qid=? ORDER BY attempt", (a.qid,)).fetchall()
+    ans = _latest_answer(c, a.qid)
+
+    L = [f"# {q['id']} 题解", "",
+         f"- 检材：`{q['artifact']}`",
+         f"- 题型：{TYPE_CN.get(q['type'], q['type'])}  {q['points']} 分",
+         f"- 状态：{q['status']}", "", "## 题目", "", q["stem"], ""]
+    chs = json.loads(q["choices"] or "[]")
+    if chs:
+        L += ["## 选项", ""] + [f"- {ch['k']}. {ch['t']}" for ch in chs] + [""]
+
+    if ans:
+        L += ["## 答案", "", f"**{ans['answer']}**", "",
+              f"- 置信度：{ans['confidence']}", f"- 证据：{ans['evidence'] or '-'}",
+              f"- 时间：{ans['created_at']}", ""]
+        hist = c.db.execute("SELECT * FROM answers WHERE qid=? ORDER BY id", (a.qid,)).fetchall()
+        if len(hist) > 1:
+            L += ["### 历史答案（被覆盖的）", ""]
+            for h in hist[:-1]:
+                L += [f"- {h['created_at']}  {h['answer'][:80]}"]
+            L.append("")
+    else:
+        L += ["## 答案", "", "_还没有答案_", ""]
+
+    if atts:
+        L += ["## 尝试记录", "", "| 次 | 模型 | 状态 | 起 | 止 | 备注 |", "|---|---|---|---|---|---|"]
+        for t in atts:
+            L.append(f"| {t['attempt']} | {t['model']} | {t['status']} | "
+                     f"{(t['started'] or '')[-8:]} | {(t['ended'] or '')[-8:]} | {t['note'] or ''} |")
+        L.append("")
+
+    # 线索按 attempt 分组展示：看得出哪一轮得出什么，换模型后结论怎么变的
+    by_att: dict[int, list] = {}
+    for f in finds:
+        by_att.setdefault(f["attempt"] or 0, []).append(f)
+    L += ["## 线索", ""]
+    if not by_att:
+        L += ["- （无）", ""]
+    for att in sorted(by_att, reverse=True):
+        tag = f"第 {att} 次尝试" if att else "未分轮次（早期记录）"
+        L += [f"### {tag}", ""]
+        L += [f"- [{f['kind']}] {f['text']}" + (f"  @`{f['locator']}`" if f["locator"] else "")
+              for f in by_att[att]]
+        L.append("")
+    if deads:
+        L += ["## 死路（别再走）", ""] + [f"- {d['text']}" for d in deads] + [""]
+
+    if q["artifact"]:
+        d = c.arts / idx_name(q["artifact"])
+        if d.is_dir():
+            L += ["## 相关产物", "", f"- 目录：`{d.relative_to(c.root)}/`"]
+            sub = sorted(p.name for p in d.iterdir() if p.is_dir())
+            if sub:
+                L += [f"- 子目录：{', '.join(sub)}"]
+            L.append("")
+
+    wdir = c.meta / "writeups"
+    wdir.mkdir(exist_ok=True)
+    dest = wdir / f"{q['id']}.md"
+    dest.write_text("\n".join(L) + "\n", encoding="utf-8")
+    print("\n".join(L))
+    print(f"\n（已写入 {dest.relative_to(c.root)}）")
+
+
+def cmd_attach(c: Case, a: argparse.Namespace) -> None:
+    """实时跟进某个 agent 的会话（默认最新一个）。"""
+    sessions = Path.home() / ".pi" / "agent" / "sessions"
+    enc = "--" + str(c.root).strip("/").replace("/", "-") + "--"
+    d = sessions / enc
+    if not d.is_dir():
+        die(f"没有会话目录: {d}")
+    files = sorted(d.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        die("还没有会话")
+    target = files[0]
+    if a.agent:
+        row = c.db.execute("SELECT * FROM agents WHERE id=?", (a.agent,)).fetchone()
+        if row and row["session"] and Path(row["session"]).is_file():
+            target = Path(row["session"])
+    trace = Path(__file__).resolve().parent / "internal" / "trace"
+    if trace.is_file():
+        os.execv(sys.executable, [sys.executable, str(trace), "-f", "-n", "12", str(target)])
+    print(f"（找不到 internal/trace，直接打印文件）\n{target}")
+    print(target.read_text(encoding="utf-8", errors="replace")[-4000:])
+
+
+
+def cmd_probe(c: Case, a: argparse.Namespace) -> None:
+    """对题目跑预计算探测，把候选表写进 meta/probes/<qid>.md。"""
+    import importlib.machinery, importlib.util
+    pth = Path(__file__).resolve().parent / "internal" / "probe.py"
+    if not pth.is_file():
+        die(f"找不到 probe 模块: {pth}")
+    loader = importlib.machinery.SourceFileLoader("probe", str(pth))
+    spec = importlib.util.spec_from_loader("probe", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+
+    qids = a.qids or [r["id"] for r in c.db.execute(
+        "SELECT id FROM questions WHERE status IN ('todo','blocked') ORDER BY n")]
+    made = 0
+    for qid in qids:
+        dest = mod.build(c, qid)
+        if dest:
+            print(f"  {qid} → {dest.relative_to(c.root)}（{dest.stat().st_size} 字节）")
+            made += 1
+    print(f"\n{made} 道题生成了候选表；简报会自动引用（fcase brief <QID> 重新生成）。")
+
+
+
+def cmd_unpack_all(c: Case, a: argparse.Namespace) -> None:
+    """并行解 evi/ 下所有压缩包。
+
+    实测：deflate 单核解压是瓶颈，多个包可以并行，3 个包 3.0s → 1.6s。
+    """
+    import subprocess as _sp
+    ups = [r["path"] for r in c.db.execute("SELECT path FROM artifacts ORDER BY size_bytes DESC")
+           if Path(r["path"]).suffix.lower() in (".zip", ".7z", ".rar")]
+    if not ups:
+        die("evi/ 里没有压缩包")
+    script = Path(__file__).resolve().parent / "unpack"
+    procs = []
+    for name in ups:
+        cmd = ["python3", str(script), f"evi/{name}"]
+        if a.force:
+            cmd.append("--force")
+        if a.reunpack:
+            cmd.append("--force-reunpack")
+        for x in a.skip:
+            cmd += ["--skip", x]
+        log = c.meta / f".unpack-{Path(name).stem}.log"
+        print(f"  ▶ {name}  （日志 {log.name}）")
+        procs.append((name, log, _sp.Popen(cmd, cwd=c.root,
+                                           stdout=log.open("wb"), stderr=_sp.STDOUT)))
+    bad = 0
+    for name, log, p_ in procs:
+        rc = p_.wait()
+        tail = ""
+        try:
+            tail = "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-2:])
+            log.unlink(missing_ok=True)
+        except OSError:
+            pass
+        mark = "✓" if rc == 0 else "✗"
+        if rc != 0:
+            bad += 1
+        print(f"  {mark} {name}" + (f"  rc={rc}" if rc else ""))
+        if tail and rc != 0:
+            print("    " + tail.replace("\n", "\n    "))
+    print(f"\n{len(ups) - bad}/{len(ups)} 成功（并行，jobs={len(ups)}）")
+    if bad:
+        raise SystemExit(1)
+
+
+
+def cmd_extract(c: Case, a: argparse.Namespace) -> None:
+    """批量提取：一次打开镜像取多个文件（替代 while read; do icat; done 循环）。"""
+    import subprocess as _sp
+    stem = a.artifact
+    art = None
+    for cand in c.db.execute("SELECT * FROM artifacts"):
+        if cand["path"] == stem or idx_name(cand["path"]) == stem or Path(cand["path"]).stem == stem:
+            art = cand
+            break
+    if art is None:
+        die(f"没有检材: {stem}")
+
+    img = find_image(c, art["path"])
+    src = img if img else (c.evi / art["path"])
+    outdir = Path(a.out) if a.out else (art_dir(c, art["path"]) / "extract")
+    if not outdir.is_absolute():
+        outdir = c.root / outdir
+
+    helper = Path(__file__).resolve().parent / "internal" / "dissect-extract.py"
+    py = Path.home() / "projects/forensics/tools/venv-win/bin/python3"
+    if not helper.is_file():
+        die(f"缺少 {helper}")
+
+    cmd = [str(py) if py.is_file() else "python3", str(helper), str(src), str(outdir),
+           "--limit", str(a.limit)]
+    if a.grep:
+        cmd += ["--grep", a.grep]
+    if a.paths:
+        cmd += ["--paths", a.paths]
+    print(f"  源: {src}")
+    print(f"  出: {outdir}")
+    r = _sp.run(cmd, cwd=c.root)
+    if r.returncode != 0:
+        die(f"提取失败 rc={r.returncode}")
+
+
+
+def cmd_tools(c: Case, a: argparse.Namespace) -> None:
+    """列出可用工具（精简集），顺带给路径提示。"""
+    import shutil as _sh
+    lite = Path(__file__).resolve().parent.parent / "tools" / "lite-tools.txt"
+    names = []
+    if lite.is_file():
+        names = [l.strip() for l in lite.read_text(encoding="utf-8").splitlines() if l.strip()]
+    if not names:
+        # 迁移后第一次用会走这里：现场看 PATH 里有什么
+        cand = ["fls", "icat", "istat", "fcat", "mmls", "fsstat", "7z", "rg",
+                "sqlite3", "strings", "xxd", "exiftool", "file", "ffmpeg",
+                "target-fs", "target-query", "volatility3", "jadx", "zbarimg",
+                "thin_ls", "asc2log", "cantools"]
+        names = [x for x in cand if _sh.which(x)]
+    if not names:
+        die("PATH 里没有可用的取证工具，先跑 ./setup.sh 或 ./tools/install.sh")
+    print(f"可用工具 {len(names)} 个（都在 PATH 里）：")
+    print("  " + "  ".join(names))
+    print()
+    print("常用替代：")
+    print("  fcase extract <检材> --grep '路径正则'   批量取文件（不要 while icat 循环）")
+    print("  python3 ~/projects/forensics/scripts/<x>.py   预置脚本（见下）")
+    sd = Path(__file__).resolve().parent.parent / "scripts"
+    if sd.is_dir():
+        for f in sorted(sd.glob("*.py")):
+            print(f"    scripts/{f.name}")
+
+
+
+def cmd_drive(c: Case, a: argparse.Namespace) -> None:
+    """自动反复 go，直到没有待做组或连续两轮无进展。"""
+    import subprocess as _sp
+    drv = Path(__file__).resolve().parent / "internal" / "drive.sh"
+    if not drv.is_file():
+        die(f"缺少 {drv}")
+    os.execvp("bash", ["bash", str(drv), str(int(a.rounds))])
+
+
+
+def _cmdmod():
+    """加载 bin/internal/commands.py（5 个主命令的实现）。"""
+    import importlib.machinery, importlib.util
+    pth = Path(__file__).resolve().parent / "internal" / "commands.py"
+    loader = importlib.machinery.SourceFileLoader("cmdmod", str(pth))
+    spec = importlib.util.spec_from_loader("cmdmod", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def cmd_go(c: Case, a: argparse.Namespace) -> None:
+    """起主调度器（按题组派活）。"""
+    sp = Path(__file__).resolve().parent / "internal" / "scheduler.py"
+    if not sp.is_file():
+        die(f"找不到调度器: {sp}")
+    args = [sys.executable, str(sp), "--jobs", str(a.jobs or cfg("jobs", 0))]
+    provider = getattr(a, "provider", None) or cfg("provider")
+    model = a.model or cfg("model")
+    thinking = getattr(a, "thinking", None) or cfg("thinking")
+    if provider:
+        args += ["--provider", provider]
+    if model:
+        args += ["--model", model]
+    if thinking:
+        args += ["--thinking", thinking]
+    if a.timeout:
+        args += ["--timeout", str(a.timeout)]
+    if getattr(a, "max_groups", 0):
+        args += ["--max-groups", str(a.max_groups)]
+    batch = getattr(a, "batch", 0) or cfg("batch", 1)
+    if batch and batch > 1:
+        args += ["--batch", str(batch)]
+    if getattr(a, "dry_run", False):
+        args += ["--dry-run"]
+    os.execv(sys.executable, args)
+
+
+def render_writeup(c: Case, qid: str) -> None:
+    """答案写入后自动刷新题解文件（静默）。"""
+    try:
+        ns = argparse.Namespace(qid=qid)
+        q = c.db.execute("SELECT 1 FROM questions WHERE id=?", (qid,)).fetchone()
+        if q:
+            import io, contextlib
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_why(c, ns)
+    except (OSError, ValueError, SystemExit):
+        pass
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="fcase", description="case 目录里记录检材、线索、答案")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("ls", help="列出 evi/ 并登记")
+    p.add_argument("--hash", action="store_true", help="同时算 sha256（大文件会很慢）")
+    p.set_defaults(fn=cmd_ls)
+
+    p = sub.add_parser("hash", help="算单个文件的 sha256")
+    p.add_argument("path")
+    p.set_defaults(fn=cmd_hash)
+
+    p = sub.add_parser("import", help="解析题目 → questions 表 + meta/questions.json")
+    p.add_argument("path", nargs="?", default="meta/question.md")
+    p.add_argument("--dry-run", action="store_true", help="只看解析结果，不写库")
+    p.add_argument("--map", action="append", metavar="组名=文件名", help="手动指定分组对应的检材")
+    p.set_defaults(fn=cmd_import)
+
+    p = sub.add_parser("board", help="题目看板")
+    p.add_argument("-w", "--watch", nargs="?", const=10, type=int, metavar="秒",
+                   help="原地刷新（默认 10 秒），Ctrl-C 退出")
+    p.set_defaults(fn=cmd_board)
+
+    p = sub.add_parser("next", help="下一题（先易后难）")
+    p.add_argument("--full", action="store_true", help="打印完整题干")
+    p.add_argument("--group", default=None, help="只在这一组里选，如 梁燕玲U盘")
+    p.add_argument("--by-size", action="store_true", help="按检材体积排（默认按卷子顺序）")
+    p.add_argument("--batch", type=int, default=1, help="一次取 N 题（同组连续），一行一个题号")
+    p.set_defaults(fn=cmd_next)
+
+    p = sub.add_parser("show", help="看一道题")
+    p.add_argument("qid")
+    p.set_defaults(fn=cmd_show)
+
+    p = sub.add_parser("mark", help="改题目状态")
+    p.add_argument("qid")
+    p.add_argument("status", choices=["todo", "doing", "done", "blocked"])
+    p.set_defaults(fn=cmd_mark)
+
+    p = sub.add_parser("deadend", help="记一条死路（下一个会话不会重走）")
+    p.add_argument("text")
+    p.add_argument("--q", default=None)
+    p.set_defaults(fn=cmd_deadend)
+
+    p = sub.add_parser("need", help="请求安装某东西（然后停下等人）")
+    p.add_argument("pkg")
+    p.add_argument("--reason", default=None)
+    p.add_argument("--q", default=None)
+    p.set_defaults(fn=cmd_need)
+
+    p = sub.add_parser("pending", help="看待安装清单")
+    p.set_defaults(fn=cmd_pending)
+
+    p = sub.add_parser("index", help="生成检材索引 meta/index/<stem>.json")
+    p.add_argument("artifact", nargs="?", default="all")
+    p.add_argument("--deep", action="store_true", help="忽略 work 里已解包的副本")
+    p.set_defaults(fn=cmd_index)
+
+    p = sub.add_parser("map", help="把某组题目重新绑到某个检材")
+    p.add_argument("group")
+    p.add_argument("artifact")
+    p.set_defaults(fn=cmd_map)
+
+    p = sub.add_parser("brief", help="生成 meta/briefs/<QID>.md；给多个题号则生成批量简报")
+    p.add_argument("qids", nargs="+")
+    p.set_defaults(fn=cmd_brief)
+
+    p = sub.add_parser("note", help="记一条线索")
+    p.add_argument("kind", help="类别，如 pcap / disk / mobile / flag")
+    p.add_argument("text")
+    p.add_argument("--q", default=None, help="属于哪道题，如 Q07")
+    p.add_argument("--locator", default=None, help="精确位置，如 frame=84 / offset=614400 / 文件:行")
+    p.add_argument("--src", default=None, help="来源检材路径或 sha256")
+    p.set_defaults(fn=cmd_note)
+
+    p = sub.add_parser("answer", help="记一条答案")
+    p.add_argument("question")
+    p.add_argument("answer")
+    p.add_argument("--q", default=None, help="哪道题，如 Q07（会把它标成 done）")
+    p.add_argument("--evidence", default=None)
+    p.add_argument("--confidence", type=float, default=None)
+    p.set_defaults(fn=cmd_answer)
+
+    p = sub.add_parser("status", help="概况")
+    p.set_defaults(fn=cmd_status)
+
+    p = sub.add_parser("render", help="重新生成 meta/*.md")
+    p.set_defaults(fn=cmd_render)
+
+    p = sub.add_parser("where", help="打印 case 根目录")
+    p.set_defaults(fn=cmd_where)
+
+    p = sub.add_parser("stage", help="把检材复制到原生盘 ~/scratch（提速）")
+    p.add_argument("--max-size", type=float, default=4.0,
+                   help="超过这个 GB 数就跳过，默认 4")
+    p.add_argument("--all", action="store_true", help="不限制大小，全复制")
+    p.set_defaults(fn=cmd_stage)
+
+    p = sub.add_parser("deep-index", help="对磁盘检材跑一次完整 fls，清单存 artifacts/")
+    p.add_argument("stem")
+    p.set_defaults(fn=cmd_index_deep)
+
+    p = sub.add_parser("plan", help="分类：生成模板 → agent 填 → --apply 入库")
+    p.add_argument("--apply", action="store_true", help="校验 meta/map.json 并入库")
+    p.add_argument("--auto", action="store_true", help="不用 agent，按检材粗略切分（兜底）")
+    p.set_defaults(fn=cmd_plan)
+
+    p = sub.add_parser("answers", help="答案表（每题最新一次）")
+    p.add_argument("--new", action="store_true",
+                   help="只显示上次看过之后新增的答案")
+    p.set_defaults(fn=cmd_answers)
+
+    p = sub.add_parser("agents", help="所有 agent 一览")
+    p.set_defaults(fn=cmd_agents)
+
+    p = sub.add_parser("why", help="题解：怎么查到的、走过哪些死路、换过几个模型")
+    p.add_argument("qid")
+    p.set_defaults(fn=cmd_why)
+
+    p = sub.add_parser("attach", help="实时跟进某个 agent 的会话")
+    p.add_argument("agent", nargs="?", help="agent id，如 A1；省略则取最新会话")
+    p.set_defaults(fn=cmd_attach)
+
+    p = sub.add_parser("init", help="新建 case（建目录 + 软链检材 + 放题目）")
+    p.add_argument("case_dir")
+    p.add_argument("--evi", help="检材目录（会把里面的文件软链进 evi/）")
+    p.add_argument("--question", help="题目 md 路径")
+    p.set_defaults(fn=lambda c, a: _cmdmod().cmd_init(c, a))
+
+    p = sub.add_parser("doctor", help="环境自检（工具/pi/模型凭据）")
+    p.add_argument("--no-net", action="store_true", help="跳过实际模型调用")
+    p.set_defaults(fn=lambda c, a: _cmdmod().cmd_doctor(c, a))
+
+    p = sub.add_parser("unpack", help="解包 + 建索引 + 生成清单（幂等）")
+    p.add_argument("--force", action="store_true", help="放开解压大小上限")
+    p.set_defaults(fn=lambda c, a: _cmdmod().cmd_unpack(c, a))
+
+    p = sub.add_parser("run", help="后台起做题循环（每组新会话）")
+    p.add_argument("rounds", nargs="?", type=int, default=10)
+    p.set_defaults(fn=lambda c, a: _cmdmod().cmd_run(c, a))
+
+    p = sub.add_parser("stop", help="停止做题")
+    p.set_defaults(fn=lambda c, a: _cmdmod().cmd_stop(c, a))
+
+    p = sub.add_parser("unpack-all", help="并行解 evi/ 下所有压缩包（实测 1.9x）")
+    p.add_argument("--force", action="store_true", help="放开解压大小上限")
+    p.add_argument("--reunpack", action="store_true", help="已解过也重解")
+    p.add_argument("--skip", action="append", default=[], metavar="REGEX")
+    p.set_defaults(fn=cmd_unpack_all)
+
+    p = sub.add_parser("tools", help="列出可用工具与预置脚本")
+    p.set_defaults(fn=cmd_tools)
+
+    p = sub.add_parser("extract", help="批量提取文件（一次开镜像，替代 icat 循环）")
+    p.add_argument("artifact", help="检材路径/索引名/stem")
+    p.add_argument("--grep", help="只取路径匹配该正则的文件")
+    p.add_argument("--paths", help="文件：每行一个绝对路径")
+    p.add_argument("--limit", type=int, default=200)
+    p.add_argument("-o", "--out", help="输出目录（默认 artifacts/<检材>/extract）")
+    p.set_defaults(fn=cmd_extract)
+
+    p = sub.add_parser("probe", help="预计算候选表（极值/端口/计数类题）")
+    p.add_argument("qids", nargs="*", help="题号；省略则对全部未完成的题跑")
+    p.set_defaults(fn=cmd_probe)
+
+    p = sub.add_parser("drive", help="自动反复 go，直到没有待做组")
+    p.add_argument("rounds", nargs="?", type=int, default=12, help="最多几轮")
+    p.set_defaults(fn=cmd_drive)
+
+    p = sub.add_parser("go", help="起主调度器：按题组派活给 worker")
+    p.add_argument("--jobs", "-j", type=int, default=0, help="并发组数，0=按核数自动")
+    p.add_argument("--provider", help="模型提供方：Pi 内置的（openai/anthropic/deepseek/…）或 models.json 里自定义的")
+    p.add_argument("--model")
+    p.add_argument("--thinking", help="off / minimal / low / medium / high")
+    p.add_argument("--timeout", type=int)
+    p.add_argument("--max-groups", type=int, default=0)
+    p.add_argument("--batch", type=int, default=1, help="组内一次做几题（共享会话）")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_go)
+
+    if len(sys.argv) == 1:
+        print("""fcase —— 取证 case 的唯一入口
+
+  fcase doctor        环境自检（工具 / pi / 模型凭据）
+  fcase init <dir> --evi <检材目录> [--question 题目.md]
+  fcase unpack        解包 + 建索引 + 生成清单（跑过就跳过）
+  fcase run           后台开始做题（每组建新会话）
+  fcase board         看进度
+  fcase stop          停止
+
+日常就这五条。高级用法（一般不需要）：
+  fcase answers [--new]   答案表
+  fcase why Q07           单题题解
+  fcase agents            每个 agent 在做什么
+  fcase status            吞吐 / 工具耗时 / 浪费统计
+  fcase extract <检材> --grep '正则'    批量取文件
+  fcase probe [Q07 ...]   预计算候选表
+  fcase tools             可用工具与预置脚本
+""")
+        return
+
+    a = ap.parse_args()
+    # init 的时候 case 还不存在，不能先建 Case 对象
+    if a.cmd in ("init", "doctor"):
+        if a.cmd == "init":
+            _cmdmod().cmd_init(None, a)
+        else:
+            _cmdmod().cmd_doctor(None, a)
+        return
+    c = Case()
+    try:
+        a.fn(c, a)
+        if a.cmd in {"note", "answer", "ls", "hash", "import"}:
+            render(c)
+        if a.cmd == "answer" and getattr(a, "q", None):
+            render_writeup(c, a.q)
+    finally:
+        c.close()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# 新建一个 case：evi / work / meta 三个目录
+#
+#   ./bin/case <case-id>
+#   CASES_ROOT=~/cases ./bin/case test2
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CASES_ROOT="${CASES_ROOT:-$CASES_ROOT}"
+
+id="${1:-}"
+if [ -z "$id" ]; then
+    echo "用法: $0 <case-id>" >&2
+    exit 2
+fi
+
+dir="$CASES_ROOT/$id"
+mkdir -p "$dir/evi" "$dir/work" "$dir/meta"
+
+[ -f "$dir/meta/question.md" ] || cat > "$dir/meta/question.md" <<'EOF'
+# 题目
+
+（把题目原文贴在这里，一行一题。`bin/ask` 不带参数时会读这个文件。）
+EOF
+[ -f "$dir/meta/notes.md" ] || cat > "$dir/meta/notes.md" <<'EOF'
+# 手写笔记
+
+（这里写给人看的东西。fcase 不会碰这个文件。）
+EOF
+
+chmod 555 "$dir/evi"
+
+echo "case: $dir"
+echo
+echo "  evi/    原始检材（已锁 555，写不进去）"
+echo "  work/   中间产物（解包、导出，随便写）"
+echo "  meta/   question.md notes.md findings.md answers.md evidence.db"
+echo
+echo "下一步："
+echo "  cd $dir && $ROOT/bin/add /path/to/evidence/*   # 软链进来，不复制"
+echo "  cd $dir && $ROOT/bin/ask"

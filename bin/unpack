@@ -1,0 +1,330 @@
+#!/usr/bin/env python3
+"""unpack —— 安全解包。只往 work/ 写，并检查路径穿越 / 解压炸弹 / 嵌套。
+
+    unpack <archive> [<archive>...]
+    unpack --list <archive>            只看内容，不解
+    unpack --out work/foo <archive>    指定输出目录（必须在 work/ 下）
+    unpack --max-size 5G <archive>     限制解压后总大小（默认 20G）
+    unpack --max-files 50000           限制文件数（默认 200000）
+    unpack --depth 2                   嵌套展开深度（默认 3，0 = 不展开）
+    unpack -p PASSWORD                 带密码
+    unpack --force                     无视大小限制
+
+为什么不用裸 `7z x`：
+  - `-o` 写错就到 evi/ 里去了，evi 是锁着的（555），会失败但报错难看
+  - 恶意压缩包带 `../../.ssh/authorized_keys` 会写到 case 外面
+  - 嵌套包能炸出几百 GB
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ARCHIVE_EXT = {
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".zst",
+    ".cab", ".iso", ".jar", ".apk", ".whl", ".deb", ".rpm", ".lz4", ".lzma",
+}
+
+DEFAULT_MAX_SIZE = 20 * 1024**3
+DEFAULT_MAX_FILES = 200_000
+DEFAULT_DEPTH = 3
+
+
+def die(msg: str) -> None:
+    print(f"unpack: {msg}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def human(n: float) -> str:
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024 or unit == "T":
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return str(n)
+
+
+def parse_size(s: str) -> int:
+    s = s.strip().upper()
+    mult = 1
+    if s[-1] in "KMGTP":
+        mult = 1024 ** ("KMGTP".index(s[-1]) + 1)
+        s = s[:-1]
+    try:
+        return int(float(s) * mult)
+    except ValueError:
+        die(f"看不懂的大小: {s}")
+
+
+def _rel(p: Path, root: Path) -> str:
+    """尽量显示相对路径；work/ 是软链时（指向原生盘）会跑到 root 外面，退回绝对路径。"""
+    try:
+        return str(p.relative_to(root))
+    except ValueError:
+        return str(p)
+
+
+def find_root() -> Path:
+    p = Path(os.environ.get("FCASE_ROOT") or Path.cwd()).resolve()
+    for d in (p, *p.parents):
+        if (d / "meta").is_dir():
+            return d
+    die("找不到 case 目录（需要 <case>/meta/）")
+    raise AssertionError
+
+
+def seven_zip() -> str:
+    for b in ("7z", "7zz", "7za"):
+        if shutil.which(b):
+            return b
+    die("没装 7z。运行 ./setup.sh")
+
+
+def run(cmd: list[str]) -> subprocess.CompletedProcess:
+    # stdin=DEVNULL 很关键：加密包时 7z 会提示输入密码，
+    # 非 TTY 下会卡住然后 "Break signaled"
+    return subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                          stdin=subprocess.DEVNULL)
+
+
+class Entry:
+    __slots__ = ("path", "size", "is_dir", "encrypted")
+
+    def __init__(self, path: str, size: int, is_dir: bool, encrypted: bool = False) -> None:
+        self.path, self.size, self.is_dir = path, size, is_dir
+        self.encrypted = encrypted
+
+
+def list_archive(archive: Path, password: str | None) -> tuple[list[Entry], int]:
+    """返回 (entries, 压缩包物理大小)。"""
+    cmd = [seven_zip(), "l", "-slt", str(archive), f"-p{password or ''}"]
+    r = run(cmd)
+    if r.returncode != 0:
+        die(f"7z 读不了 {archive.name}：\n{r.stderr.strip() or r.stdout.strip()[:400]}")
+
+    entries: list[Entry] = []
+    physical = 0
+    for block in r.stdout.split("\n\n"):
+        kv = {}
+        for line in block.splitlines():
+            if " = " in line:
+                k, v = line.split(" = ", 1)
+                kv[k.strip()] = v.strip()
+        if "Path" not in kv or "Folder" not in kv:
+            if kv.get("Physical Size"):
+                physical = int(kv["Physical Size"])
+            continue
+        entries.append(Entry(
+            path=kv["Path"],
+            size=int(kv.get("Size") or 0),
+            is_dir=kv["Folder"] == "+",
+            encrypted=kv.get("Encrypted") == "+",
+        ))
+    return entries, physical
+
+
+def unsafe_reason(name: str) -> str | None:
+    norm = name.replace("\\", "/")
+    if norm.startswith("/"):
+        return "绝对路径"
+    if len(norm) > 1 and norm[1] == ":":
+        return "Windows 绝对路径"
+    parts = [p for p in norm.split("/") if p not in ("", ".")]
+    if ".." in parts:
+        return "含 ../ 路径穿越"
+    return None
+
+
+def check(entries: list[Entry], max_size: int, max_files: int, force: bool,
+          password: str | None = None) -> None:
+    enc = [e for e in entries if e.encrypted]
+    if enc and password is None:
+        die(f"这是加密包（{len(enc)} 个条目，如 {enc[0].path}）。\n"
+            f"        先找密码，再用: unpack -p '<密码>' <archive>")
+    bad = [(e.path, r) for e in entries if (r := unsafe_reason(e.path))]
+    if bad:
+        print("unpack: 压缩包里有不安全的路径，拒绝解压：", file=sys.stderr)
+        for path, reason in bad[:10]:
+            print(f"  {reason}: {path}", file=sys.stderr)
+        raise SystemExit(2)
+
+    files = [e for e in entries if not e.is_dir]
+    total = sum(e.size for e in files)
+    if not force and total > max_size:
+        die(f"解压后 {human(total)} 超过上限 {human(max_size)}。"
+            f"确认安全后用 --max-size {human(total * 1.1)} 或 --force")
+    if not force and len(files) > max_files:
+        die(f"解压后有 {len(files)} 个文件，超过上限 {max_files}。用 --max-files 调高")
+
+
+def extract(archive: Path, out: Path, password: str | None,
+            skip: list[str] | None = None) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    cmd = [seven_zip(), "x", "-y", f"-o{out}", str(archive), f"-p{password or ''}"]
+    # 7z 的排除语法：-xr!<pattern>（r=递归，! 表示排除）
+    for pat in skip or []:
+        cmd.append(f"-xr!{pat}")
+    r = run(cmd)
+    if r.returncode != 0:
+        die(f"解压 {archive.name} 失败（exit {r.returncode}）：\n"
+            f"{r.stderr.strip() or r.stdout.strip()[:500]}")
+
+
+def _sig(archive: Path, a: argparse.Namespace) -> str:
+    """已解包签名：只依赖 archive 大小 + skip 规则，不用解压就能算，"""
+    try:
+        size = archive.stat().st_size
+    except OSError:
+        size = 0
+    return f"{archive.name}|{size}|{','.join(sorted(getattr(a, 'skip', []) or []))}"
+
+
+def expand(archive: Path, out: Path, a: argparse.Namespace,
+           budget: dict, depth: int) -> None:
+    # ① 先查"已解过"——必须在 list_archive / check() 之前，
+    #    否则大包会先撞上 max-size 上限直接 die，跳过逻辑根本轮不到。
+    marker = out / ".unpacked"
+    sig = _sig(archive, a)
+    if marker.is_file() and not getattr(a, "force_reunpack", False):
+        try:
+            if marker.read_text(encoding="utf-8").strip() == sig:
+                print(f"  已解过，跳过（省一次解压）：{archive.name}")
+                return
+        except OSError:
+            pass
+
+    entries, physical = list_archive(archive, a.password)
+    check(entries, a.max_size, a.max_files, a.force, a.password)
+
+    files = [e for e in entries if not e.is_dir]
+    total = sum(e.size for e in files)
+    budget["size"] += total
+    budget["files"] += len(files)
+    # 这里也要看 force：check() 已经放过单个包了，累计检查再拦一次等于 --force 失效
+    if not a.force and budget["size"] > a.max_size:
+        die(f"累计解压 {human(budget['size'])} 超过上限 {human(a.max_size)}，停止")
+
+    print(f"  {archive.name}  ({human(physical)} 压缩 / {human(total)} 解压, {len(files)} 文件)")
+
+    # 9p（/mnt/*）上的大包：先顺序拷到原生盘再解。
+    # 实测 9p 顺序读 149MB/s，但 7z 的随机小读在 9p 上只有它的几分之一；
+    # 先拷（纯顺序）再本地解，整体从 ~20 分钟降到 ~10 分钟。
+    src = archive
+    tmpdir = None
+    try:
+        on_9p = str(archive).startswith("/mnt/")
+        big = physical > (1 << 30)
+        if on_9p and big and a.stage:
+            import tempfile
+            tmpdir = Path(tempfile.mkdtemp(prefix="unpack-stage-"))
+            dst = tmpdir / archive.name
+            print(f"  9p 上的大包，先顺序拷到原生盘：{human(physical)} …", end="", flush=True)
+            t0 = time.time()
+            with archive.open("rb") as fin, dst.open("wb") as fout:
+                shutil.copyfileobj(fin, fout, 8 << 20)
+            print(f" {time.time() - t0:.0f}s")
+            src = dst
+    except OSError as exc:
+        print(f"  （暂存失败，直接解：{exc}）")
+        src = archive
+
+    try:
+        extract(src, out, a.password, getattr(a, "skip", None))
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    try:
+        marker.write_text(sig, encoding="utf-8")
+    except OSError:
+        pass
+
+    if depth >= a.depth:
+        return
+
+    nested = sorted(
+        p for p in out.rglob("*")
+        if p.is_file() and p.suffix.lower() in ARCHIVE_EXT and p != archive
+    )
+    for p in nested:
+        sub = p.parent / f"{p.stem}_x"
+        print(f"  ↳ 嵌套: {p.relative_to(out)}")
+        expand(p, sub, a, budget, depth + 1)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(
+        prog="unpack", description="安全解包到 work/，带穿越/炸弹/嵌套防护")
+    ap.add_argument("archives", nargs="+")
+    ap.add_argument("-l", "--list", action="store_true", help="只列内容，不解压")
+    ap.add_argument("--out", default=None, help="输出目录（必须在 work/ 下）")
+    ap.add_argument("--skip", action="append", default=[], metavar="REGEX",
+                    help="跳过名字匹配该正则的条目，可多次。例：--skip '_ram|memory'")
+    ap.add_argument("--max-size", default="20G")
+    ap.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
+    ap.add_argument("--depth", type=int, default=DEFAULT_DEPTH,
+                    help="嵌套展开深度，0 = 不展开（默认 3）")
+    ap.add_argument("-p", "--password", default=None)
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--force-reunpack", action="store_true",
+                    help="已解过也强制重解（默认签名一致就跳过）")
+    ap.add_argument("--stage", action="store_true",
+                    help="9p 上的大包先拷到原生盘再解（实测只快 16%%，还要 2 倍临时空间，默认关）")
+    a = ap.parse_args()
+    a.max_size = parse_size(a.max_size)
+    sys.stdout.reconfigure(line_buffering=True)  # 否则 stderr 会插到 stdout 前面
+
+    root = find_root()
+    work = (root / "work").resolve()
+    work.mkdir(exist_ok=True)
+
+    if a.out:
+        out_base = (Path(a.out) if Path(a.out).is_absolute() else root / a.out).resolve()
+        if work not in out_base.parents and out_base != work:
+            die(f"输出目录必须在 {work} 下，你给的是 {out_base}")
+    else:
+        out_base = work / "unpack"
+
+    if a.list:
+        for name in a.archives:
+            p = Path(name)
+            if not p.is_absolute():
+                p = (root / name) if (root / name).exists() else p
+            entries, physical = list_archive(p.resolve(), a.password)
+            files = [e for e in entries if not e.is_dir]
+            print(f"\n== {p.name}  ({human(physical)}, {len(files)} 文件, "
+                  f"解压后 {human(sum(e.size for e in files))})")
+            for e in entries[:80]:
+                mark = "/" if e.is_dir else ""
+                print(f"  {human(e.size):>8}  {e.path}{mark}")
+            if len(entries) > 80:
+                print(f"  ... 还有 {len(entries) - 80} 项")
+        return
+
+    budget = {"size": 0, "files": 0}
+    for name in a.archives:
+        p = Path(name)
+        if not p.is_absolute():
+            p = (root / name) if (root / name).exists() else p
+        p = p.resolve()
+        if not p.is_file():
+            die(f"不是文件: {p}")
+
+        out = out_base / p.stem if a.out is None else out_base
+        # 有 .unpacked 标记就留在主目录，交给后面的签名检查决定是否跳过；
+        # 否则（是别人留下的半成品）换个 _x 目录，避免混在一起
+        if out.exists() and any(out.iterdir()) and not (out / ".unpacked").is_file():
+            out = out_base / f"{p.stem}_x"
+        print(f"\n== {p.name} -> {_rel(out, root)}")
+        expand(p, out, a, budget, 0)
+
+    print(f"\n合计解压 {human(budget['size'])}，{budget['files']} 个文件")
+    print(f"输出在 {_rel(out_base, root)}/")
+
+
+if __name__ == "__main__":
+    main()

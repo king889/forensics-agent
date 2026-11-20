@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# 一屏看进度：run.log 尾部 + 看板尾部。给 watch 用：
+#   watch -n 3 -t watch-case
+#   watch -n 3 -t "watch-case $CASES_ROOT/test"
+set -uo pipefail
+case_dir="${1:-$(pwd)}"
+cd "$case_dir" 2>/dev/null || { echo "进不去 $case_dir"; exit 2; }
+[ -d meta ] || { echo "$case_dir 不是 case 目录（缺 meta/）"; exit 2; }
+
+echo "== $case_dir  $(date +%H:%M:%S) =="
+tail -10 meta/run.log 2>/dev/null || echo "（还没 run.log）"
+echo "──────────────────────────────────────────"
+fcase board 2>/dev/null | tail -4

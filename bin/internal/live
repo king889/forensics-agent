@@ -1,0 +1,155 @@
+#!/usr/bin/env python3
+"""一屏看完当前做题状态：谁在跑哪题、跑了多久、最近发生了什么。
+
+用法：
+    live                # 打印一次
+    live -w             # 持续刷新（Ctrl+C 退出）
+    live -w -n 3        # 3 秒刷新一次
+    live --log 20       # 多看几行日志
+
+和 watch-case 的区别：watch-case 只看 run.log 尾部 + 看板；
+live 还会告诉你**每个 worker 现在卡在哪道题、跑了多久、最后跑的命令是什么**。
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+CASE = Path(os.environ.get("CASE_DIR") or Path.cwd())
+DIM, BOLD, GREEN, YELLOW, RED, CYAN, RESET = (
+    "\033[2m", "\033[1m", "\033[32m", "\033[33m", "\033[31m", "\033[36m", "\033[0m"
+)
+
+
+def sh(cmd: list[str]) -> str:
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def workers() -> list[tuple[str, str, str]]:
+    """返回 [(题号, 已跑时长, 模型)]，从进程命令行里抠。"""
+    out = sh(["ps", "-eo", "etime,args"])
+    rows = []
+    for line in out.splitlines():
+        if "bin/solve " not in line or "solve-par" in line:
+            continue
+        m = re.search(r"bin/solve\s+(.*)$", line)
+        if not m:
+            continue
+        args = m.group(1)
+        q = re.search(r"\bQ\d+\b", args)
+        model = re.search(r"--model\s+(\S+)", args)
+        etime = line.split(None, 1)[0]
+        rows.append((q.group(0) if q else "?", etime, model.group(1) if model else "默认"))
+    return sorted(set(rows))
+
+
+def db_counts() -> tuple[int, int, dict[str, int]]:
+    p = CASE / "meta" / "evidence.db"
+    if not p.is_file():
+        return 0, 0, {}
+    con = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+    try:
+        total = con.execute("SELECT count(*) FROM questions").fetchone()[0]
+        done = con.execute("SELECT count(*) FROM questions WHERE status='done'").fetchone()[0]
+        by = dict(con.execute("SELECT status, count(*) FROM questions GROUP BY status"))
+        return done, total, by
+    finally:
+        con.close()
+
+
+def tail(path: Path, n: int) -> list[str]:
+    if not path.is_file():
+        return []
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            return [l.rstrip() for l in fh.readlines()[-n:]]
+    except OSError:
+        return []
+
+
+def last_commands(n: int) -> list[str]:
+    import json
+
+    rows = tail(CASE / "meta" / "cmdlog.jsonl", n)
+    out = []
+    for line in rows:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        cmd = " ".join(str(e.get("cmd", "")).split())[:100]
+        out.append(f"{e.get('ms', 0) / 1000:6.1f}s  {cmd}")
+    return out
+
+
+def bar(done: int, total: int, width: int = 40) -> str:
+    if not total:
+        return ""
+    filled = int(width * done / total)
+    return f"[{'█' * filled}{'░' * (width - filled)}] {done}/{total}"
+
+
+def render(log_n: int) -> None:
+    print(f"\033[2J\033[H", end="")  # 清屏
+    done, total, by = db_counts()
+    print(f"{BOLD}{CASE}{RESET}   {time.strftime('%H:%M:%S')}")
+    print(f"{bar(done, total)}   "
+          + "  ".join(f"{k}={v}" for k, v in sorted(by.items()) if k != "done"))
+    print()
+
+    ws = workers()
+    print(f"{BOLD}正在跑（{len(ws)} 个）{RESET}")
+    if not ws:
+        print(f"  {DIM}没有 worker 在跑{RESET}")
+    for q, etime, model in ws:
+        print(f"  {CYAN}{q:5}{RESET} 已跑 {etime:>9}   模型 {model}")
+    print()
+
+    print(f"{BOLD}最近日志{RESET}")
+    for line in tail(CASE / "meta" / "run.log", log_n):
+        color = GREEN if "✓" in line else (RED if "✗" in line else "")
+        print(f"  {color}{line}{RESET}")
+    print()
+
+    print(f"{BOLD}最后几条命令{RESET}")
+    for line in last_commands(4):
+        print(f"  {DIM}{line}{RESET}")
+    print(f"\n{DIM}Ctrl+C 退出   ·   trace -n 10 看模型思考   ·   fcase board 看全卷{RESET}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="做题实时面板")
+    ap.add_argument("-w", "--watch", action="store_true", help="持续刷新")
+    ap.add_argument("-n", "--interval", type=float, default=3.0)
+    ap.add_argument("--log", type=int, default=8, help="显示几行 run.log")
+    args = ap.parse_args()
+
+    if not (CASE / "meta").is_dir():
+        print(f"{CASE} 不是 case 目录（缺 meta/）", file=sys.stderr)
+        return 2
+
+    if not args.watch:
+        render(args.log)
+        return 0
+    try:
+        while True:
+            render(args.log)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

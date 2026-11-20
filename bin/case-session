@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# 给一个 case 开独立的 tmux 会话 —— 做题/看进度都在这里，不占用开发会话。
+#
+#   bin/case-session <case目录> [--run]
+#   bin/case-session            # 在 case 目录里直接调用，自动取 pwd
+#
+# 三个窗格：
+#   左上  进度看板（每 5 秒刷新）
+#   左下  日志（run.log / drive.log）
+#   右    shell（在 case 目录，可以直接 fcase stop / fcase why）
+#
+# 加 --run 会先在后台起 fcase run。
+# 会话名：fcase-<case目录名>。重进：tmux attach -t fcase-<名字>
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FCASE="$ROOT/bin/fcase"
+
+CASE=""
+DO_RUN=0
+for a in "$@"; do
+    case $a in
+        --run) DO_RUN=1 ;;
+        -h|--help) sed -n '2,15p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *) CASE=$a ;;
+    esac
+done
+CASE=${CASE:-$PWD}
+
+if [ ! -d "$CASE/meta" ]; then
+    echo "✗ $CASE 不是 case 目录（缺 meta/）"
+    echo "  先建：fcase init <目录> --evi <检材目录> --question <题目.md>"
+    exit 1
+fi
+CASE=$(cd "$CASE" && pwd)
+NAME="fcase-$(basename "$CASE" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//')"
+
+if ! command -v tmux >/dev/null 2>&1; then
+    cat <<EOF
+没装 tmux，用两个终端代替：
+
+  终端 1（看进度，原地刷新）
+    cd $CASE && $FCASE board -w 5
+
+  终端 2（做题）
+    cd $CASE && $FCASE run
+
+想装 tmux：Debian/Ubuntu 用包管理器装 tmux，Fedora 同理，Arch 同理。
+EOF
+    exit 0
+fi
+
+if tmux has-session -t "$NAME" 2>/dev/null; then
+    echo "会话已存在，直接接入：$NAME"
+    exec tmux attach -t "$NAME"
+fi
+
+if [ "$DO_RUN" = 1 ]; then
+    ( cd "$CASE" && "$FCASE" run >/dev/null 2>&1 & )
+    sleep 1
+fi
+
+tmux new-session -d -s "$NAME" -c "$CASE" -n board "$FCASE board -w 5"
+tmux split-window -t "$NAME:board" -v -l 40% -c "$CASE" \
+    "tail -n 40 -F meta/run.log meta/drive.log 2>/dev/null"
+tmux split-window -t "$NAME:board" -h -l 42% -c "$CASE" \
+    "printf '\n  case: %s\n  常用：fcase board / answers --new / why Q07 / stop\n\n' '$CASE'; exec \$SHELL"
+tmux select-pane -t "$NAME:board.0"
+
+echo "已开会话：$NAME"
+echo "  接入：tmux attach -t $NAME"
+echo "  离开：Ctrl-b d（会话继续跑）"
+echo "  关闭：tmux kill-session -t $NAME"
+exec tmux attach -t "$NAME"

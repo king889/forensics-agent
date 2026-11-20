@@ -1,0 +1,40 @@
+{
+  "_comment": [
+    "provider/model 换成你自己的。provider 可以是 Pi 内置的",
+    "（openai / anthropic / deepseek / gemini / openrouter / groq …，不需要 models.json），",
+    "也可以是你在 ~/.pi/agent/models.json 里自定义的网关或本地模型。",
+    "key 不写在这里，由 Pi 从环境变量或 ~/.pi/agent/auth.json 解析。",
+    "详见 docs/setup-credentials.md。"
+  ],
+  "provider": "opengateway",
+  "model": "deepseek/deepseek-v4.1-flash-eco",
+  "thinking": "off",
+  "batch": 2,
+  "jobs": 0,
+  "attempt_max_calls": 40,
+  "attempt_soft_deadline_s": 480,
+  "stdout_preview_bytes": 3072,
+  "tool_timeouts": {
+    "fls": 300,
+    "icat": 60,
+    "istat": 30,
+    "fsstat": 30,
+    "mmls": 20,
+    "fcat": 60,
+    "rg": 30,
+    "grep": 30,
+    "sqlite3": 30,
+    "strings": 60,
+    "xxd": 20,
+    "7z": 600,
+    "unzip": 600,
+    "target-fs": 120,
+    "target-query": 300,
+    "volatility3": 900,
+    "vol.py": 900,
+    "exiftool": 60,
+    "apktool": 120,
+    "jadx": 300,
+    "zbarimg": 30
+  }
+}
