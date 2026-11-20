@@ -191,3 +191,8 @@ target-query -f mft.timeline evi/win.E01 > work/mft_timeline.txt
 | `hayabusa` 报没有规则 | `hayabusa update-rules`，或检查 `tools/hayabusa/rules/` |
 | Chrome 历史时间全是 1601 年 | 正常，是 WebKit 纪元，见 §6 换算 |
 | 注册表 hive 改了时间戳 | `regipy-parse-header` 看 hive 自己的 last written，不是文件 mtime |
+| 镜像里只有 Windows 系统卷、没有业务数据 | 业务可能在 LVM thin / Ceph / 另一块盘，先确认拿到的是不是"宿主机系统盘" |
+| `_00W.csv`、`xxx.db` 打不开 | 先 `xxd -l 16` 看文件头：`PK`=zip、`SQLite format 3`=明文库、`Rar!`=rar、全随机=加密（见 `crypto` 技能） |
+| BitLocker 卷要恢复密钥 | 找 `Windows/System32/config`、`Recovery/`、Microsoft 账户、AD；`bdeinfo` 看 key protector 类型 |
+| 从镜像里取几十个文件很慢 | 用 `fcase extract <检材> --grep RE`（一次开镜像批量取），不要 `for inode; do icat; done` |
+| 系统盘里 grep 不到任何业务字符串 | 正常。业务数据常在数据库/浏览器库/聊天记录里，用清单按扩展名定位，别全盘 `grep -a` |

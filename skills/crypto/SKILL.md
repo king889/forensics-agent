@@ -169,3 +169,33 @@ md5sum mnemonic.txt | awk '{print toupper($1)}'
 | 金额小数位 | BEP-20 的 decimals 可能是 0/6/18，别自作主张除以 1e18 |
 | 二维码 | 用 zbarimg，不要用视觉模型 |
 | 容器大小 | 别把容器大小和里面文件系统大小搞混 |
+
+## 6. 加密数据怎么认（先分类，再动手）
+
+| 文件头（`xxd -l 16`） | 是什么 | 怎么开 |
+|---|---|---|
+| `PK\x03\x04` | zip，可能 AES 加密 | `7z l -slt` 看 `Method`；AES 要密码，ZipCrypto 可 `bkcrack` |
+| `Rar!\x1a\x07` | rar（rar5 常见） | `unrar l` 看是否 `*` 标记加密 |
+| `SQLite format 3` | 明文 SQLite | 直接 `sqlite3` |
+| 全随机、无魔数 | SQLCipher / VeraCrypt / 加密容器 | 试 `sqlcipher`、`cryptsetup`；看大小是否整 MiB |
+| `\xd0\xcf\x11\xe0` | OLE（Office 老格式） | `olevba`、`msoffcrypto-tool` |
+| `%PDF` | PDF | `pdfcrack`、`qpdf --decrypt` |
+
+**CSV / DB 被加密**时先判断是哪一类：整包加密（zip/7z 包着）还是单文件加密
+（SQLCipher、Office 加密）。前者要包密码，后者要文件密码，找的地方不一样。
+
+**ZipCrypto 已知明文攻击**（有包内某个已知文件即可，不用爆破）：
+
+```bash
+bkcrack -C enc.zip -c known.txt -p known.txt -d out.zip
+```
+
+**VeraCrypt 的 keyfile**：密码之外可能还要 keyfile（任意文件，常叫 `*.key`/`*.dat`）。
+先按大小和位置找可疑小文件，`bin/vcopen` 会把挂载命令打出来。
+
+## 7. 密码通常藏在这几处
+
+题目描述 → 图片 OCR / 二维码 → 另一个检材的文本文件 → 浏览器保存的密码 →
+注册表 → 聊天记录 → 压缩包注释（`7z l -slt` 的 `Comment`）。
+先穷举这些，再考虑爆破。
+

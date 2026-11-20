@@ -96,6 +96,12 @@ fcase answer "USB 里有几个分区" "2 个" \
 | `vol --help` 里没有 hashdump | 缺 pycryptodome，`install.sh mem` 重装 |
 | `strings` 扫不到 flag | 加 `-e l` 扫 UTF-16LE |
 | 大文件操作很慢 | `/mnt/d` 是 9p，先 `cp` 到 `~/scratch/` 再处理 |
+| 命令跑很久被超时杀掉 | `fls` 大卷要 200s+、`volatility` 要 900s；超时改分段（按分区/inode 范围）或换工具，别原样重试 |
+| `find /` 之类的全盘扫描 | 直接拒绝：已经有文件清单了，`rg` 清单比扫盘快几个数量级 |
+| 对镜像 `grep -a` | 拒绝：先 `strings` 或按清单定位文件，再 `rg` 具体文件 |
+| `for inode; do icat; done` 逐个取文件 | 拒绝：用 `fcase extract <检材> --grep RE`，一次开镜像批量取 |
+| 输出被截断看不全 | 全文已落盘到 `work/`，用 `read` 打开，不要重跑命令 |
+| 题目一直 blocked | 看 `meta/blocked.md` 的原因行：402/401/429 是模型账号问题，超时是资源问题，只有"找不到"才是证据问题 |
 
 ## 答题口径：照抄原文，不要推测
 

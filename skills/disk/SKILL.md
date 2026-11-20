@@ -144,6 +144,59 @@ istat -o 614400 evi/disk.img 12345    # 单个 inode 的全部元数据
 **隐藏分区** → `mmls` 里 `Unallocated` 区间，或手工扫：
 `binwalk evi/disk.img | rg -i 'filesystem|partition'`
 
+## 9. LVM / thin pool / BlueStore
+
+服务器镜像常见三层：分区表 → LVM PV → LV（或 thin pool）→ 文件系统。
+**别看到"分区里没有文件系统"就放弃**，往下挖一层。
+
+```bash
+# 1. 分区里是不是 LVM（看得到 LABELONE / LVM2 001）
+strings -t d evi/disk.img | rg -m5 "LABELONE|LVM2 001"
+
+# 2. 把 PV 段切出来（只读检材，产物写 work/）
+dd if=evi/disk.img of=work/pv.img bs=512 skip=<start_lba> count=<len> conv=noerror,sync
+
+# 3. 读元数据
+pvs --config 'devices{scan=["./work/pv.img"]}' 2>/dev/null
+thin_dump -m work/tmeta.bin > work/thin.xml
+thin_ls work/tdata.bin
+```
+
+现成脚本（切段 + 解析一次做完）：
+
+```bash
+scripts/lvm-thin-dump.py evi/disk.img --partition-lba <start> -o work/lvm
+```
+
+| 现象 | 含义 |
+|---|---|
+| `thin_check` 通过但里面什么都没有 | 只说明元数据没坏，**不代表有数据** |
+| `METADATA_FREE_BLOCKS=262113` | 元数据区**空闲**块数，不是数据块数，别当"有 26 万块数据" |
+| LV 只有 `pve-root` / `pve-swap` | 拿到的是 PVE 宿主机系统盘；业务数据在别的物理盘或 Ceph 里 |
+| `thin_ls` 的 `MAPPED_BLOCKS` 全 0 | thin volume 未分配，数据不在这里 |
+| 分区带 `ceph_bluestore` 标签 | BlueStore OSD，**没有文件系统**，需要 `ceph-bluestore-tool`（root） |
+
+BlueStore 里捞数据的兜底：按 ext4 超级块签名扫（超级块在 1024 字节偏移，`0x438` 处是 `53 ef`）：
+
+```bash
+python3 - <<'PY'
+import mmap
+f = open('evi/disk02.img', 'rb')
+m = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+hits, off = [], 0
+while len(hits) < 20:
+    i = m.find(b'\x53\xef', off)
+    if i < 0:
+        break
+    if (i - 0x438) % 4096 == 0:
+        hits.append(i - 0x438)      # 候选超级块位置
+    off = i + 1
+print(hits)
+PY
+```
+
+找到候选后按 1 MiB 对齐切一段，`fsstat` 验证是不是 ext4，再 `fls -o`。
+
 ## 记录示例
 
 ```bash
@@ -158,3 +211,10 @@ fcase note disk "镜像有两个数据分区" \
   `ewfexport` 或 `tsk_recover` 出来
 - 30GB 级镜像先确认扇区大小（`mmls -b 4096`），否则分区表全是乱的
 - `fls` 的 `-o` 是**扇区数**，不是字节数
+- **没有分区表**的单卷镜像（整盘就是一个 NTFS/ext4）：`mmls` 会失败（rc=1），
+  直接 `fsstat evi/disk.img` 从偏移 0 读，别反复调 `mmls`
+- **大卷 `fls` 很慢**：28 万条目要 200 秒以上。别用默认超时，也别反复重跑；
+  跑一次把结果存成清单，之后只 `rg` 清单
+- **多人目录的检材**：`方俊郎/phone.E01` 和 `黄志远/phone.E01` 同名，
+  索引/清单目录必须用**完整相对路径**命名，否则两套清单互相覆盖
+- E01 分卷（`.E01` + `.E02`…）要整组给，只给第一卷才能拼回去

@@ -250,6 +250,7 @@ mdf.save("work/decoded.mf4", overwrite=True)
 | `cantools decode` 一个信号都没解出来 | ID 对不上：`--frame-id-mask` 放宽匹配，或 DBC 是扩展帧（29 位）而日志是 11 位 |
 | `candump` 报 `No such device` | 没有 CAN 口，离线分析不需要它，用 `log2asc` 等文本工具 |
 | `pip install asammdf` 在 py3.14 上要编译半天/失败 | 用 `tools/venv-auto`（py3.12），别往 `tools/venv` 里塞 |
+| `asc2log: command not found` | can-utils 装在 `tools/bin`，`bin/solve` 会自动加 PATH；手跑要先 `export PATH=$PWD/tools/bin:$PATH` |
 
 ---
 

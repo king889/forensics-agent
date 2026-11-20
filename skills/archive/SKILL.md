@@ -102,6 +102,22 @@ fcase note archive "压缩包内 2 个 JPG，时间戳 2025-09-29 17:18/17:24" \
     --src evi/IQ_Coin_Type_Transactions.zip
 ```
 
+## 加密包：先分清哪一种
+
+```bash
+7z l -slt evi/x.zip | rg -i "method|encrypted|comment"
+```
+
+| Method / 现象 | 类型 | 开法 |
+|---|---|---|
+| `AES-256` + `Encrypted = +` | AES 加密 | 必须要密码；已知明文也救不了 |
+| `ZipCrypto` / `Deflate` 但解压要密码 | ZipCrypto | 有包内已知文件时可用 `bkcrack` 已知明文攻击 |
+| 文件名能列、内容要密码 | 传统 zip 加密 | 同上 |
+| 连文件名都列不出来 | rar5 / 7z 头加密 | 只能找密码 |
+
+密码来源按这个顺序找：题目描述 → 图片 OCR/二维码 → 同案其它检材的文本 →
+压缩包注释 → 浏览器/注册表保存的口令。**先找再爆破**，见 `crypto` 技能。
+
 ## 注意
 
 - `7z l` 的时间是**本地时区**解释的，实际存的是 DOS 时间，跨时区题要注意
