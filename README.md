@@ -278,8 +278,8 @@ FCASE_PROVIDER=openai FCASE_MODEL=gpt-5 fcase run
 
 ```bash
 cd ~/forensics-agent
-bin/case-session /mnt/d/Cyber/Forensic/APK2026          # 只开会话
-bin/case-session /mnt/d/Cyber/Forensic/APK2026 --run    # 顺便起 fcase run
+bin/case-session ~/cases/APK2026          # 只开会话
+bin/case-session ~/cases/APK2026 --run    # 顺便起 fcase run
 ```
 
 ```
